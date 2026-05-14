@@ -36,17 +36,16 @@ for ECG, Oximeter, Blood Pressure and Scale products.
   s.default_subspecs = 'Core'
 
   # ── Core subspec ─────────────────────────────────────────────────────
+  # VTMProductLib 1.5 ships a real `ios-arm64_x86_64-simulator` slice, so
+  # Apple-Silicon hosts can build & run the iOS Simulator natively — no
+  # `EXCLUDED_ARCHS` workaround required.
   s.subspec 'Core' do |cs|
     cs.source_files        = 'Classes/**/*'
     cs.public_header_files = 'Classes/**/*.h'
     cs.pod_target_xcconfig = {
       'DEFINES_MODULE' => 'YES',
-      'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386 arm64',
       'CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES' => 'YES',
       'OTHER_LDFLAGS' => '$(inherited) -ObjC',
-    }
-    cs.user_target_xcconfig = {
-      'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'arm64',
     }
   end
 
