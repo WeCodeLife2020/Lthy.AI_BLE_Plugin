@@ -1498,7 +1498,10 @@ commandCompletion:(u_char)cmdType
             case 0: {
                 VTMBPMeasuringData mm = [VTMBLEParser parseBPMeasuringData:dataSlice];
                 d[@"measureType"] = @"bp_measuring";
-                d[@"pressure"]    = @(mm.pressure);
+                // VTMBPMeasuringData.pressure is in mmHg*100 per
+                // VTMBLEStruct.h (`实时压（mmHg）*100`).
+                d[@"pressure"]    = @(mm.pressure / 100.0);
+                d[@"pressureRaw"] = @(mm.pressure);
                 d[@"pr"]          = @(mm.pulse_rate);
                 d[@"isDeflate"]   = ((mm.is_deflating != 0) ? @YES : @NO);
                 d[@"isPulse"]     = ((mm.is_get_pulse != 0) ? @YES : @NO);
@@ -1581,12 +1584,14 @@ commandCompletion:(u_char)cmdType
 
     if (cmdType == VTMBPCmdGetRealPressure) {
         VTMRealTimePressure p = [VTMBLEParser parseBPRealTimePressure:response];
+        // VTMRealTimePressure.pressure is in mmHg*100 per VTMBLEStruct.h.
         [self sendEvent:@{@"event":        @"rtData",
                           @"deviceType":   @"bp",
                           @"deviceFamily": family,
                           @"model":        @(self.connectedModel),
                           @"measureType":  @"bp_pressure",
-                          @"pressure":     @(p.pressure)}];
+                          @"pressure":     @(p.pressure / 100.0),
+                          @"pressureRaw":  @(p.pressure)}];
         return;
     }
 
