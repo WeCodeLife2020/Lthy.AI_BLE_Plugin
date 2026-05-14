@@ -1432,7 +1432,7 @@ commandCompletion:(u_char)cmdType
                           @"batteryState": @(flag.batteryStatus),
                           @"recordTime": @(rt.run_para.record_time),
                           @"curStatus": @(st.curStatus),
-                          @"isLeadOff": @(flag.rMark == 0 && st.curStatus == 0),
+                          @"isLeadOff": ((flag.rMark == 0 && st.curStatus == 0) ? @YES : @NO),
                           @"ecgFloats": mv,
                           @"ecgShorts": raw,
                           @"samplingRate": @125,
@@ -1500,8 +1500,8 @@ commandCompletion:(u_char)cmdType
                 d[@"measureType"] = @"bp_measuring";
                 d[@"pressure"]    = @(mm.pressure);
                 d[@"pr"]          = @(mm.pulse_rate);
-                d[@"isDeflate"]   = @(mm.is_deflating != 0);
-                d[@"isPulse"]     = @(mm.is_get_pulse != 0);
+                d[@"isDeflate"]   = ((mm.is_deflating != 0) ? @YES : @NO);
+                d[@"isPulse"]     = ((mm.is_get_pulse != 0) ? @YES : @NO);
                 break;
             }
             case 1: {
@@ -1520,8 +1520,8 @@ commandCompletion:(u_char)cmdType
                 d[@"measureType"]  = @"ecg_measuring";
                 d[@"hr"]           = @(em.pulse_rate);
                 d[@"curDuration"]  = @(em.duration);
-                d[@"isLeadOff"]    = @((em.special_status & 0x02) != 0);
-                d[@"isPoolSignal"] = @((em.special_status & 0x01) != 0);
+                d[@"isLeadOff"]    = (((em.special_status & 0x02) != 0) ? @YES : @NO);
+                d[@"isPoolSignal"] = (((em.special_status & 0x01) != 0) ? @YES : @NO);
                 NSMutableArray *mv = [NSMutableArray arrayWithCapacity:rt.rt_wav.wav.sampling_num];
                 NSMutableArray *sh = [NSMutableArray arrayWithCapacity:rt.rt_wav.wav.sampling_num];
                 for (int i = 0; i < rt.rt_wav.wav.sampling_num && i < 300; i++) {
@@ -1725,7 +1725,7 @@ commandCompletion:(u_char)cmdType
                           @"pi":             @(info.pi / 10.0),
                           @"status":         @(info.status),
                           @"batLevel":       @((info.res >> 6) & 0x03),
-                          @"probeOff":       @((info.status & 0x02) != 0)}];
+                          @"probeOff":       (((info.status & 0x02) != 0) ? @YES : @NO)}];
         return;
     }
     if (cmdType == VTMFOxiCmdWaveResp) {
