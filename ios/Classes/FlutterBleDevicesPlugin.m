@@ -97,6 +97,7 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
 #if FBD_HAS_ICOMON
 // iComon SDK state — only present when the IComon subspec is active.
 @property (nonatomic, assign) BOOL iComonInitialized;
+@property (nonatomic, assign) BOOL iComonPendingScan; // queued scan() that arrived before onInitFinish:
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ICScanDeviceInfo *> *iComonScans; // macAddr → scan info
 @property (nonatomic, strong) ICDevice *activeIComonDevice;
 @property (nonatomic, strong) ICUserInfo *currentUserInfo;
@@ -157,6 +158,17 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
 // Pending commands
 @property (nonatomic, copy)   FlutterResult pendingInitResult;
 
+// Connection-deploy watchdog. CoreBluetooth's `connectPeripheral:` has
+// no timeout — if the peripheral powers off mid-connect or the
+// VTMURATUtils service-discovery flow stalls, `utilDeployCompletion:`
+// never fires and the consumer is left hanging. We arm this timer in
+// `handleConnect:` and cancel it from the deploy callbacks; if it
+// fires, we surface a `deploy_timeout` disconnect event and tear the
+// connection down. Default 15 s — tuned to comfortably cover service
+// discovery on slow peripherals (BP2 Pro is the worst we've seen at
+// ~6 s) without leaving stuck UI for too long.
+@property (nonatomic, strong) NSTimer *connectionWatchdog;
+
 @end
 
 @implementation FlutterBleDevicesPlugin
@@ -183,11 +195,25 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
         _connectedModel = -1;
 #if FBD_HAS_ICOMON
         _iComonScans    = [NSMutableDictionary dictionary];
+        // Mirror every documented default in ICUserInfo.h. `[ICUserInfo new]`
+        // zero-inits BOOLs/ints, so without explicit assignment the SDK
+        // silently disables impedance / HR / balance / gravity even on
+        // supported scales — matching the iComon ICDemo reference VC.
         _currentUserInfo = [ICUserInfo new];
-        _currentUserInfo.age        = 25;
-        _currentUserInfo.height     = 175;
-        _currentUserInfo.sex        = ICSexTypeMale;
-        _currentUserInfo.peopleType = ICPeopleTypeNormal;
+        _currentUserInfo.userIndex               = 1;
+        _currentUserInfo.age                     = 25;
+        _currentUserInfo.height                  = 175;
+        _currentUserInfo.weight                  = 60.0f;
+        _currentUserInfo.sex                     = ICSexTypeMale;
+        _currentUserInfo.peopleType              = ICPeopleTypeNormal;
+        _currentUserInfo.weightUnit              = ICWeightUnitKg;
+        _currentUserInfo.rulerUnit               = ICRulerUnitCM;
+        _currentUserInfo.rulerMode               = ICRulerMeasureModeLength;
+        _currentUserInfo.kitchenUnit             = ICKitchenScaleUnitG;
+        _currentUserInfo.enableMeasureImpendence = YES;
+        _currentUserInfo.enableMeasureHr         = YES;
+        _currentUserInfo.enableMeasureBalance    = YES;
+        _currentUserInfo.enableMeasureGravity    = YES;
 #endif
     }
     return self;
@@ -254,17 +280,26 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     NSNumber *isMaleNum = call.arguments[@"isMale"];
 
     ICUserInfo *info = [ICUserInfo new];
-    info.userIndex   = 1;
-    info.height      = heightNum ? (NSUInteger)heightNum.doubleValue : 170;
-    info.age          = ageNum    ? (NSUInteger)ageNum.integerValue   : 25;
-    info.sex          = (isMaleNum == nil || isMaleNum.boolValue) ? ICSexTypeMale : ICSexTypeFemal;
-    info.peopleType   = ICPeopleTypeNormal;
+    info.userIndex               = 1;
+    info.height                  = heightNum ? (NSUInteger)heightNum.doubleValue : 175;
+    info.age                     = ageNum    ? (NSUInteger)ageNum.integerValue   : 25;
+    info.weight                  = 60.0f;
+    info.sex                     = (isMaleNum == nil || isMaleNum.boolValue) ? ICSexTypeMale : ICSexTypeFemal;
+    info.peopleType              = ICPeopleTypeNormal;
+    info.weightUnit              = ICWeightUnitKg;
+    info.rulerUnit               = ICRulerUnitCM;
+    info.rulerMode               = ICRulerMeasureModeLength;
+    info.kitchenUnit             = ICKitchenScaleUnitG;
     info.enableMeasureImpendence = YES;
     info.enableMeasureHr         = YES;
+    info.enableMeasureBalance    = YES;
+    info.enableMeasureGravity    = YES;
 
     self.currentUserInfo = info;
     if (self.iComonInitialized) {
         [[ICDeviceManager shared] updateUserInfo:info];
+        FBD_LOG(@"iComon updateUserInfo pushed (height=%lu age=%lu sex=%d)",
+                (unsigned long)info.height, (unsigned long)info.age, (int)info.sex);
     }
     result(@YES);
 #else
@@ -285,13 +320,22 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
 #if FBD_HAS_ICOMON
     // Bring up the iComon SDK exactly once (opt-in subspec).
     if (!self.iComonInitialized) {
+        // Order matches the 1.3.0_b1312 ICDemo: updateUserInfo → delegate →
+        // initMgr. The SDK reads user context during init and during the
+        // first scan callback, so pushing it after init creates a window
+        // where impedance/HR can be silently disabled on supported scales.
+        [[ICDeviceManager shared] updateUserInfo:self.currentUserInfo];
         ICDeviceManagerConfig *cfg = [ICDeviceManagerConfig new];
         cfg.isShowPowerAlert = NO;
         [[ICDeviceManager shared] setDelegate:self];
         [[ICDeviceManager shared] initMgrWithConfig:cfg];
-        [[ICDeviceManager shared] updateUserInfo:self.currentUserInfo];
         // iComonInitialized becomes YES once onInitFinish:YES fires.
-        FBD_LOG(@"iComon SDK init requested");
+        FBD_LOG(@"iComon SDK init requested (userIndex=%lu height=%lu sex=%d impedance=%d hr=%d)",
+                (unsigned long)self.currentUserInfo.userIndex,
+                (unsigned long)self.currentUserInfo.height,
+                (int)self.currentUserInfo.sex,
+                (int)self.currentUserInfo.enableMeasureImpendence,
+                (int)self.currentUserInfo.enableMeasureHr);
     }
 #endif
     self.serviceInitialized = YES;
@@ -324,31 +368,51 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     NSArray *models = call.arguments[@"models"];
     self.scanModelFilter = ([models isKindOfClass:NSArray.class]) ? models : nil;
 
-    [self.discovered removeAllObjects];
-    [self.advData    removeAllObjects];
-    [self.mappings   removeAllObjects];
+    // NOTE: we deliberately do NOT clear `discovered`/`advData`/`mappings`
+    // on rescan. Consumers commonly drive the UI as scan() → user picks
+    // → connect(mac), but they may also re-trigger scan() before
+    // committing (refresh button, retry-after-error, etc.). Wiping the
+    // cache means the user can hit "connect" with a mac that was
+    // discovered seconds ago but is no longer in `discovered` because a
+    // rescan zeroed it. The peripheral instance is still valid — keep
+    // it. Garbage-collection happens naturally on disconnect or on
+    // app-lifecycle teardown.
 
     if (![self isBluetoothPoweredOn]) {
         // Defer until powered-on via centralManagerDidUpdateState:
         self.scanRequested = YES;
+        FBD_LOG(@"scan deferred — BT not powered on (state=%ld)", (long)self.central.state);
         result(@YES);
         return;
     }
     [self startCentralScan];
 #if FBD_HAS_ICOMON
-    // iComon SDK scans independently via its own CBCentralManager.
+    // iComon SDK scans independently via its own CBCentralManager. If
+    // init is still in flight, queue the request — `onInitFinish:` will
+    // replay it once the SDK is ready.
     if (self.iComonInitialized) {
         [self.iComonScans removeAllObjects];
         [[ICDeviceManager shared] scanDevice:self];
+        self.iComonPendingScan = NO;
+    } else {
+        self.iComonPendingScan = YES;
+        FBD_LOG(@"iComon scan deferred — onInitFinish has not fired yet");
     }
 #endif
-    FBD_LOG(@"scan started (models=%@)", self.scanModelFilter ?: @"any");
+    FBD_LOG(@"scan started (models=%@, cache=%lu peripherals)",
+            self.scanModelFilter ?: @"any", (unsigned long)self.discovered.count);
     result(@YES);
 }
 
 - (void)startCentralScan {
+    // AllowDuplicates=YES so we keep getting adv reports for the same
+    // peripheral. Some Viatom devices (notably ER1 family) initially
+    // advertise with an empty/short local name, then complete the name
+    // a few packets later — if duplicates are suppressed we miss the
+    // complete name and `mappingForAdvertisedName:` returns nil. The
+    // small extra battery cost is worth the discovery reliability.
     [self.central scanForPeripheralsWithServices:nil
-                                         options:@{CBCentralManagerScanOptionAllowDuplicatesKey: @NO}];
+                                         options:@{CBCentralManagerScanOptionAllowDuplicatesKey: @YES}];
     self.scanRequested = NO;
 }
 
@@ -360,6 +424,7 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     if (self.iComonInitialized) {
         [[ICDeviceManager shared] stopScan];
     }
+    self.iComonPendingScan = NO;
 #endif
     self.scanRequested = NO;
     FBD_LOG(@"scan stopped");
@@ -411,6 +476,16 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
         [[ICDeviceManager shared] addDevice:dev callback:^(ICDevice * _Nonnull device, ICAddDeviceCallBackCode code) {
             // Connection state update comes through onDeviceConnectionChanged:state:
         }];
+        // Mirror the URAT/AirBP lifecycle so Dart sees `connecting` on
+        // every protocol path; `onDeviceConnectionChanged:` will cancel
+        // the watchdog and emit `connected` on success.
+        [self sendEvent:@{@"event": @"connectionState",
+                          @"state": @"connecting",
+                          @"mac": mac ?: @"",
+                          @"sdk": @"icomon",
+                          @"family": @"icomon",
+                          @"deviceType": @"scale"}];
+        [self armConnectionWatchdog];
         result(@YES);
         return;
 #else
@@ -436,9 +511,17 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
         }
     }
     if (peripheral == nil) {
+        // The peripheral is unknown to CoreBluetooth in this process —
+        // either scan() was never called, or the OS evicted the
+        // peripheral after a long idle. Either way the consumer must
+        // re-scan; we return a structured error with a clearer
+        // recovery hint than the generic UNKNOWN_DEVICE.
+        FBD_LOG(@"connect failed — unknown peripheral mac=%@ (cache=%lu)",
+                mac, (unsigned long)self.discovered.count);
         result([FlutterError errorWithCode:@"UNKNOWN_DEVICE"
-                                   message:@"Device not discovered — call scan() first"
-                                   details:nil]);
+                                   message:@"Peripheral not in CoreBluetooth cache. Call scan() and wait for the deviceFound event before connect()."
+                                   details:@{@"mac": mac ?: @"",
+                                             @"cacheSize": @(self.discovered.count)}]);
         return;
     }
 
@@ -463,7 +546,45 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     FBD_LOG(@"connect mac=%@ family=%@ model=%ld path=%d", mac, mapping.family,
             (long)mapping.lepuModel, (int)mapping.protocolPath);
     [self.central connectPeripheral:peripheral options:nil];
+
+    // Surface a `connecting` state immediately so the consumer can
+    // distinguish "connect() returned" from "peripheral actually
+    // linked". Without this, the Dart side only sees `connected` /
+    // `disconnected` and has no way to drive a spinner during the
+    // (sometimes >5 s) service-discovery phase.
+    [self sendEvent:@{@"event": @"connectionState",
+                      @"state": @"connecting",
+                      @"model": @(mapping.lepuModel),
+                      @"family": mapping.family ?: @"unknown",
+                      @"deviceType": mapping.deviceType ?: @"unknown"}];
+
+    [self armConnectionWatchdog];
     result(@YES);
+}
+
+- (void)armConnectionWatchdog {
+    [self.connectionWatchdog invalidate];
+    __weak typeof(self) weakSelf = self;
+    self.connectionWatchdog = [NSTimer scheduledTimerWithTimeInterval:15.0
+                                                              repeats:NO
+                                                                block:^(NSTimer * _Nonnull timer) {
+        typeof(self) strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+        if (strongSelf.serviceDeployed) return; // already up; spurious fire
+        FBD_LOG(@"connection watchdog fired — deploy_timeout for mapping=%@",
+                strongSelf.activeMapping.family ?: @"unknown");
+        if (strongSelf.activePeripheral) {
+            [strongSelf.central cancelPeripheralConnection:strongSelf.activePeripheral];
+        }
+        [strongSelf sendEvent:@{@"event": @"connectionState",
+                                @"state": @"disconnected",
+                                @"reason": @"deploy_timeout"}];
+    }];
+}
+
+- (void)cancelConnectionWatchdog {
+    [self.connectionWatchdog invalidate];
+    self.connectionWatchdog = nil;
 }
 
 - (void)handleDisconnect:(FlutterResult)result {
@@ -1000,35 +1121,55 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
 }
 
 - (void)centralManager:(CBCentralManager *)central didConnectPeripheral:(CBPeripheral *)peripheral {
-    peripheral.delegate = self;
     VTMDeviceMapping *m = self.activeMapping;
     if (m == nil) m = self.mappings[peripheral.identifier.UUIDString];
-    FBD_LOG(@"didConnect uuid=%@ path=%d", peripheral.identifier.UUIDString, (int)m.protocolPath);
+    FBD_LOG(@"didConnect uuid=%@ path=%d family=%@",
+            peripheral.identifier.UUIDString, (int)m.protocolPath, m.family);
+
     if (m.protocolPath == VTMProtocolPathAirBP) {
-        // Drive the peripheral ourselves — no VT/VTM util is involved.
+        // AirBP is a plain Nordic-UART device — we drive the peripheral
+        // directly. We MUST set ourselves as the CBPeripheralDelegate
+        // because there's no SDK util in this path.
+        peripheral.delegate = self;
         self.uratUtil = nil;
         self.o2Util   = nil;
         self.airBPRxBuffer = [NSMutableData data];
         [peripheral discoverServices:@[[CBUUID UUIDWithString:kAirBPServiceUUID]]];
         return;
     }
+
+    // For URAT and legacy-O2 paths, the SDK takes ownership of the
+    // peripheral and its CBPeripheralDelegate via `setPeripheral:` —
+    // it then drives `discoverServices` / `discoverCharacteristics`
+    // internally and notifies us through `utilDeployCompletion:`
+    // (URAT) or `o2_serviceDeployed:` (legacy O2). Setting
+    // `peripheral.delegate = self` here would be quickly clobbered
+    // and risk a brief window where messages route to us with no
+    // handler in place. The official viatom-dev demo (`VTConnectViewController.m`)
+    // assigns the peripheral to the SDK util WITHOUT touching the
+    // CBPeripheralDelegate — we mirror that exactly.
+    NSDictionary *advData = self.advData[peripheral.identifier.UUIDString];
     if (m.protocolPath == VTMProtocolPathO2Legacy) {
         VTO2Communicate *util = [VTO2Communicate new];
         util.o2Delegate = self;
         util.delegate   = self;
         util.deviceDelegate = self;
-        [util setPeripheral:peripheral advertisementData:self.advData[peripheral.identifier.UUIDString]];
+        if (advData) util.advertisementData = advData;
+        util.peripheral = peripheral;
         self.o2Util = util;
         self.uratUtil = nil;
+        FBD_LOG(@"VTO2Communicate util attached — awaiting o2_serviceDeployed:");
     } else {
         VTMURATUtils *util = [VTMURATUtils new];
         util.delegate = self;
         util.deviceDelegate = self;
-        [util setPeripheral:peripheral advertisementData:self.advData[peripheral.identifier.UUIDString]];
+        if (advData) util.advertisementData = advData;
+        util.peripheral = peripheral;
         self.uratUtil = util;
         self.o2Util = nil;
+        FBD_LOG(@"VTMURATUtils util attached — awaiting utilDeployCompletion:");
     }
-    // We do NOT yet emit "connected" — we wait for service-deployed callback.
+    // We do NOT yet emit "connected" — we wait for the deploy callback.
 }
 
 - (void)centralManager:(CBCentralManager *)central
@@ -1036,6 +1177,7 @@ didFailToConnectPeripheral:(CBPeripheral *)peripheral
                  error:(NSError *)error {
     FBD_LOG(@"didFailToConnect uuid=%@ err=%@",
             peripheral.identifier.UUIDString, error.localizedDescription);
+    [self cancelConnectionWatchdog];
     self.activePeripheral = nil;
     self.activeMapping    = nil;
     self.connectedModel   = -1;
@@ -1050,6 +1192,7 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
                  error:(NSError *)error {
     FBD_LOG(@"didDisconnect uuid=%@ err=%@",
             peripheral.identifier.UUIDString, error.localizedDescription);
+    [self cancelConnectionWatchdog];
     [self stopRtPoll];
     // Surface any in-flight file read as a `cancelled` error so the Dart
     // future doesn't hang.
@@ -1073,6 +1216,7 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
 #pragma mark - VTMURATDeviceDelegate  (URAT / WOxi / FOxi / ...)
 
 - (void)utilDeployCompletion:(VTMURATUtils *)util {
+    [self cancelConnectionWatchdog];
     self.serviceDeployed = YES;
     self.connectedModel  = self.activeMapping.lepuModel;
     FBD_LOG(@"URAT deploy complete model=%ld family=%@",
@@ -1085,7 +1229,11 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
 }
 
 - (void)utilDeployFailed:(VTMURATUtils *)util {
-    FBD_LOG(@"URAT deploy FAILED");
+    [self cancelConnectionWatchdog];
+    FBD_LOG(@"URAT deploy FAILED — services or characteristics not discoverable");
+    if (self.activePeripheral) {
+        [self.central cancelPeripheralConnection:self.activePeripheral];
+    }
     [self sendEvent:@{@"event": @"connectionState",
                       @"state": @"disconnected",
                       @"reason": @"service_discovery_failed"}];
@@ -1730,15 +1878,22 @@ commandCompletion:(u_char)cmdType
 #pragma mark - VTO2CommunicateDelegate  (legacy 0xAA O2Ring path)
 
 - (void)o2_serviceDeployed:(BOOL)completed {
+    [self cancelConnectionWatchdog];
     if (completed) {
         self.serviceDeployed = YES;
         self.connectedModel  = self.activeMapping.lepuModel;
+        FBD_LOG(@"O2 deploy complete model=%ld family=%@",
+                (long)self.connectedModel, self.activeMapping.family);
         [self sendEvent:@{@"event": @"connectionState",
                           @"state": @"connected",
                           @"model": @(self.connectedModel),
                           @"family": self.activeMapping.family ?: @"oxy",
                           @"deviceType": @"oximeter"}];
     } else {
+        FBD_LOG(@"O2 deploy FAILED — services or characteristics not discoverable");
+        if (self.activePeripheral) {
+            [self.central cancelPeripheralConnection:self.activePeripheral];
+        }
         [self sendEvent:@{@"event": @"connectionState",
                           @"state": @"disconnected",
                           @"reason": @"service_discovery_failed"}];
@@ -1885,6 +2040,13 @@ commandCompletion:(u_char)cmdType
 - (void)onInitFinish:(BOOL)bSuccess {
     self.iComonInitialized = bSuccess;
     FBD_LOG(@"iComon onInitFinish=%@", bSuccess ? @"YES" : @"NO");
+    [self sendEvent:@{@"event": @"icomonReady", @"ok": @(bSuccess)}];
+    if (bSuccess && self.iComonPendingScan) {
+        FBD_LOG(@"iComon replaying deferred scan");
+        [self.iComonScans removeAllObjects];
+        [[ICDeviceManager shared] scanDevice:self];
+        self.iComonPendingScan = NO;
+    }
 }
 
 - (void)onBleState:(ICBleState)state {
@@ -1895,8 +2057,10 @@ commandCompletion:(u_char)cmdType
 
 - (void)onDeviceConnectionChanged:(ICDevice *)device state:(ICDeviceConnectState)state {
     if (device == nil) return;
+    [self cancelConnectionWatchdog];
     if (state == ICDeviceConnectStateConnected) {
         self.serviceDeployed = YES;
+        FBD_LOG(@"iComon connected mac=%@", device.macAddr);
         [self sendEvent:@{@"event": @"connectionState",
                           @"state":  @"connected",
                           @"mac":    device.macAddr ?: @"",
@@ -1905,6 +2069,7 @@ commandCompletion:(u_char)cmdType
                           @"deviceType": @"scale"}];
     } else {
         self.serviceDeployed = NO;
+        FBD_LOG(@"iComon disconnected mac=%@", device.macAddr);
         if ([device.macAddr isEqualToString:self.activeIComonDevice.macAddr]) {
             self.activeIComonDevice = nil;
             if (self.activeMapping.protocolPath == VTMProtocolPathIComon) {
@@ -2136,6 +2301,8 @@ commandCompletion:(u_char)cmdType
 - (void)peripheral:(CBPeripheral *)peripheral didDiscoverServices:(NSError *)error {
     if (self.activeMapping.protocolPath != VTMProtocolPathAirBP) return;
     if (error) {
+        [self cancelConnectionWatchdog];
+        FBD_LOG(@"AirBP discoverServices failed: %@", error.localizedDescription);
         [self sendEvent:@{@"event": @"connectionState",
                           @"state": @"disconnected",
                           @"reason": error.localizedDescription ?: @"discover_services_failed"}];
@@ -2149,6 +2316,8 @@ commandCompletion:(u_char)cmdType
             return;
         }
     }
+    [self cancelConnectionWatchdog];
+    FBD_LOG(@"AirBP service %@ not advertised by peripheral", kAirBPServiceUUID);
     [self sendEvent:@{@"event": @"connectionState",
                       @"state": @"disconnected",
                       @"reason": @"airbp_service_not_found"}];
@@ -2159,6 +2328,8 @@ didDiscoverCharacteristicsForService:(CBService *)service
              error:(NSError *)error {
     if (self.activeMapping.protocolPath != VTMProtocolPathAirBP) return;
     if (error) {
+        [self cancelConnectionWatchdog];
+        FBD_LOG(@"AirBP discoverCharacteristics failed: %@", error.localizedDescription);
         [self sendEvent:@{@"event": @"connectionState",
                           @"state": @"disconnected",
                           @"reason": error.localizedDescription ?: @"discover_chars_failed"}];
@@ -2180,14 +2351,18 @@ didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)characteristic
     if (self.activeMapping.protocolPath != VTMProtocolPathAirBP) return;
     if ([characteristic.UUID.UUIDString caseInsensitiveCompare:kAirBPRxCharUUID] != NSOrderedSame) return;
     if (error) {
+        [self cancelConnectionWatchdog];
+        FBD_LOG(@"AirBP subscribe failed: %@", error.localizedDescription);
         [self sendEvent:@{@"event": @"connectionState",
                           @"state": @"disconnected",
                           @"reason": error.localizedDescription ?: @"subscribe_failed"}];
         return;
     }
     if (!characteristic.isNotifying) return;
+    [self cancelConnectionWatchdog];
     self.serviceDeployed = YES;
     self.connectedModel  = self.activeMapping.lepuModel;
+    FBD_LOG(@"AirBP deploy complete model=%ld", (long)self.connectedModel);
     [self sendEvent:@{@"event": @"connectionState",
                       @"state": @"connected",
                       @"model": @(self.connectedModel),

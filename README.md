@@ -156,6 +156,65 @@ Minimum iOS deployment target: **iOS 11**. All vendored xcframeworks are
 device-only arm64 (no `ios-arm64-simulator` slice), so the podspec excludes
 `arm64` from the simulator build — run on a **physical device**.
 
+#### iOS connect lifecycle
+
+The plugin emits `connectionState` events in a strict order so the
+consumer can drive a deterministic UI:
+
+```
+scan() → deviceFound (1..N)
+connect(mac) → connectionState{state: "connecting"}
+            → connectionState{state: "connected", model, family, deviceType}
+            → (commands now permitted; ensureReady passes)
+```
+
+If service discovery doesn't complete within **15 s** (peripheral
+powered off mid-connect, GATT stall on a flaky device, etc.) the
+plugin cancels the connection and emits:
+
+```
+connectionState{state: "disconnected", reason: "deploy_timeout"}
+```
+
+Other failure reasons surfaced on the `disconnected` event include
+`service_discovery_failed`, `airbp_service_not_found`,
+`subscribe_failed`, `connect_failed`, `bluetooth_off`, and
+`device_disconnected` (iComon).
+
+#### Troubleshooting "device not connecting" on iOS
+
+1. **Permissions** — confirm `NSBluetoothAlwaysUsageDescription` (and
+   the legacy `NSBluetoothPeripheralUsageDescription` for iOS 12 and
+   below) are in your app's `Info.plist`. Without them
+   `CBCentralManager` silently stays in `unauthorized` state and
+   neither scan nor connect will work — and there's no visible error.
+2. **Bluetooth permission alert** — first launch on iOS 13+ shows the
+   permission prompt the first time `CBCentralManager` is allocated;
+   `initService()` triggers that. If the user taps "Don't Allow", scan
+   returns nothing forever. `requestPermissions()` returns the live
+   permission status — gate your "scan" button on that.
+3. **Run on a physical device** — every vendored xcframework
+   (`VTMProductLib`, `ICDeviceManager`, `ICBleProtocol`,
+   `ICBodyFatAlgorithms`, `ICLogger`) is arm64-only. Simulator
+   builds will link-fail; even a successful simulator link won't
+   actually drive a BLE radio.
+4. **Mid-debug-session stale peripheral** — Xcode reattaches don't
+   reset CoreBluetooth's peripheral cache, but iOS does evict
+   peripherals after long idle. If `connect()` returns
+   `UNKNOWN_DEVICE`, call `scan()` again — the `cacheSize` field on
+   the error details tells you how many peripherals are currently
+   discovered.
+5. **`deploy_timeout` reason** — almost always a peripheral that
+   advertised the right name but couldn't complete GATT service
+   discovery. Power-cycle the device, increase RSSI by moving closer,
+   and retry. The plugin auto-cancels the connection on timeout so
+   you can immediately call `connect()` again.
+6. **Verbose logging** — the plugin emits structured `[FBDevices]`
+   `NSLog` lines for every scan, connect, didConnect, deploy
+   complete / failed, and disconnect transition. Tail them in Xcode's
+   "Devices and Simulators" console window, or
+   `idevicesyslog | grep FBDevices` on a tethered device.
+
 #### Updating the iComon SDK
 
 The iComon SDK currently vendored is `iOS_1.3.0_b1312`. When the vendor

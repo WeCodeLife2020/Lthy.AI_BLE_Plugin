@@ -35,3 +35,8 @@ migrate_working_dir/
 # Backup created by tools/translate_lepu_aar.py -- the original vendor AAR
 # is reproducible from Lepu's distribution and should not be tracked.
 android/libs/*.aar.orig
+
+# iComon iOS SDK reference drops. The xcframework is vendored under
+# `ios/Frameworks/`; the full SDK archive is kept locally for header /
+# demo lookup but should not be tracked.
+/1.*_b*/
