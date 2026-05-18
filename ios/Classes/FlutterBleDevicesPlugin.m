@@ -1350,9 +1350,18 @@ commandCompletion:(u_char)cmdType
         self.pendingReadFileName  = nil;
         self.pendingReadBuffer    = nil;
         self.pendingReadTotalSize = 0;
+        // Stamp the connected peripheral's identity onto the event so
+        // downstream Dart can build a `BloodPressureModel` / `EcgModel`
+        // with `deviceMac` + `deviceName` populated. Without these the
+        // server-side dedup keys collapse and the history page can't
+        // group readings by device.
+        NSString *mac        = self.activePeripheral.identifier.UUIDString ?: @"";
+        NSString *deviceName = self.activePeripheral.name ?: @"";
         [self sendEvent:@{@"event":        @"fileReadComplete",
                           @"deviceFamily": family,
                           @"model":        @(self.connectedModel),
+                          @"mac":          mac,
+                          @"deviceName":   deviceName,
                           @"fileName":     fileName,
                           @"size":         @(content.length),
                           @"content":      [content base64EncodedStringWithOptions:0]}];
@@ -1514,8 +1523,25 @@ commandCompletion:(u_char)cmdType
                 d[@"dia"]         = @(mr.diastolic_pressure);
                 d[@"mean"]        = @(mr.mean_pressure);
                 d[@"pr"]          = @(mr.pulse_rate);
-                d[@"result"]      = @(mr.medical_result);
-                d[@"stateCode"]   = @(mr.state_code);
+                // VTMBPEndMeasureData has TWO codes (see VTMBLEStruct.h):
+                //   `state_code`     状态码    – measurement success/error
+                //                              (0 = OK, 1+ = movement /
+                //                              cuff-leak / over-pressure /
+                //                              weak-pulse / aborted, etc.).
+                //   `medical_result` 诊断结果 – BP CLASSIFICATION
+                //                              (normal / elevated /
+                //                              stage-1 / stage-2 / crisis).
+                // Consumers (DoctorsApp blood_pressure_page) treat
+                // `result == 0` as success. Emitting `medical_result`
+                // there caused every non-normal reading to be rejected
+                // as an error (e.g. SYS 118 / DIA 86 → stage-1 → result
+                // == 2 → "Measurement unsuccessful"). Always surface the
+                // state_code under `result` so the success check works,
+                // and forward the classification under `medicalResult`
+                // so the UI can still render a category badge later.
+                d[@"result"]        = @(mr.state_code);
+                d[@"stateCode"]     = @(mr.state_code);
+                d[@"medicalResult"] = @(mr.medical_result);
                 break;
             }
             case 2: {
