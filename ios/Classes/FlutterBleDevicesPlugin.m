@@ -155,6 +155,32 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
 @property (nonatomic, assign) BOOL measuring;
 @property (nonatomic, assign) uint32_t mSeriesPollIndex;
 
+// ECG real-time pump is **response-paced**, NOT fixed-interval.
+//
+// Background: the original implementation used a 0.3 s NSTimer that
+// fired `requestECGRealData` regardless of whether the previous
+// request had been answered. CoreBluetooth is happy to queue multiple
+// outstanding URAT commands on the same characteristic, but the Lepu
+// ER1 / ER1-W firmware can only buffer one in flight before its rt
+// buffer drains, which produced two visible symptoms in the live
+// preview on iOS:
+//
+//   1. Sticky "Electrode off" — short batches landed entirely between
+//      QRS complexes and tripped the Dart-side flat-line heuristic.
+//   2. Glitchy / stalled waveform — the device occasionally returned
+//      an empty packet because the previous request was still being
+//      reassembled, then later returned a double-sized burst when
+//      both queued requests resolved together.
+//
+// Both issues vanish if we fire the *next* request only after the
+// previous response has been handed to `parseECGResponse:`. We keep a
+// safety watchdog (`ecgRtWatchdog`) that re-issues the request if no
+// response arrives within `_ecgRtWatchdogInterval`, covering the rare
+// case where the SDK silently drops a request during a transient BLE
+// stall. Together this matches the smoothness of Android's push-based
+// `LiveEventBus.EventEr1RtData` stream without needing a new SDK.
+@property (nonatomic, strong) NSTimer *ecgRtWatchdog;
+
 // Pending commands
 @property (nonatomic, copy)   FlutterResult pendingInitResult;
 
@@ -651,10 +677,16 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     // most Viatom URAT commands are single-shot GETs.
     switch (m.vtmDeviceType) {
         case VTMDeviceTypeECG: {
+            // Response-paced pump — see the `ecgRtWatchdog` header
+            // comment for the rationale. We stop any leftover fixed
+            // interval timer first (defensive: handleStartMeasurement
+            // can be re-invoked after a brief disconnect), fire the
+            // first request, then let the response handler drive every
+            // subsequent request.
+            [self stopRtPoll];
+            self.measuring = YES;
+            [self armEcgRtWatchdog];
             [self.uratUtil requestECGRealData];
-            [self startRtPollEvery:0.3 withBlock:^(VTMURATUtils *u) {
-                [u requestECGRealData];
-            }];
             break;
         }
         case VTMDeviceTypeBP: {
@@ -776,6 +808,63 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
         [self.rtPollTimer invalidate];
         self.rtPollTimer = nil;
     }
+    [self cancelEcgRtWatchdog];
+}
+
+#pragma mark - ECG response-paced pump
+
+// Interval after which we assume a `requestECGRealData` response has
+// been lost and the pump needs a kick. Chosen to comfortably exceed
+// the longest observed rt-data turn-around (~1.5 s on a clean BLE
+// link) while still recovering quickly enough that the Dart-side
+// lead-off watchdog (6 s) never fires on a healthy stream.
+static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
+
+/// Schedule (or re-arm) the safety watchdog. Called on every
+/// `requestECGRealData` we send; cancelled when the corresponding
+/// response arrives in `parseECGResponse:`.
+- (void)armEcgRtWatchdog {
+    [self cancelEcgRtWatchdog];
+    if (!self.measuring) return;
+    __weak typeof(self) weakSelf = self;
+    self.ecgRtWatchdog = [NSTimer scheduledTimerWithTimeInterval:kEcgRtWatchdogInterval
+                                                         repeats:NO
+                                                           block:^(NSTimer * _Nonnull t) {
+        __strong typeof(weakSelf) s = weakSelf;
+        if (s == nil) return;
+        if (!s.measuring || s.uratUtil == nil) return;
+        // No response in `kEcgRtWatchdogInterval` — the SDK either
+        // swallowed the request or the device dropped it during a
+        // BLE stall. Re-issue and re-arm.
+        [s.uratUtil requestECGRealData];
+        [s armEcgRtWatchdog];
+    }];
+}
+
+- (void)cancelEcgRtWatchdog {
+    if (self.ecgRtWatchdog) {
+        [self.ecgRtWatchdog invalidate];
+        self.ecgRtWatchdog = nil;
+    }
+}
+
+/// Pace the next `requestECGRealData`. Called from `parseECGResponse:`
+/// the instant a real-time-data frame is handed to Dart. A tiny
+/// dispatch delay gives CoreBluetooth's notification queue a moment to
+/// drain so we don't immediately stomp on the channel; in practice
+/// 20-50 ms is plenty and keeps the effective rt cadence at ≈1 Hz on
+/// ER1-class firmware.
+- (void)scheduleNextEcgRtRequest {
+    if (!self.measuring) return;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) s = weakSelf;
+        if (s == nil) return;
+        if (!s.measuring || s.uratUtil == nil) return;
+        [s.uratUtil requestECGRealData];
+        [s armEcgRtWatchdog];
+    });
 }
 
 - (void)handleGetDeviceInfo:(FlutterMethodCall *)call result:(FlutterResult)result {
@@ -1462,6 +1551,14 @@ commandCompletion:(u_char)cmdType
         }
         if (isEr1) self.lastEr1CurStatus = cur;
         if (isEr2) self.lastEr2CurStatus = cur;
+        // Response-paced pump: every rt-data frame we deliver to Dart
+        // immediately requests the next one. This is what keeps the
+        // iOS stream as smooth as Android's push-based LiveEventBus
+        // path — without it, the device returns empty packets between
+        // the fixed-timer ticks and the Dart UI sees stalls + sticky
+        // lead-off. The watchdog will re-issue if no response arrives.
+        [self cancelEcgRtWatchdog];
+        [self scheduleNextEcgRtRequest];
         return;
     }
     if (cmdType == VTMECGCmdGetRealWave) {
