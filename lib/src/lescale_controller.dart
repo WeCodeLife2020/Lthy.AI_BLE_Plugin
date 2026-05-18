@@ -258,17 +258,25 @@ class LescaleController {
       // Reset HR for new measurement, don't use the checksum byte (index 10)
       int heartRate = 0;
 
-      // IMPEDANCE: Big Endian at 8, 9
+      // IMPEDANCE: Big Endian at 8, 9. Some F4 firmware variants do not
+      // include impedance in the 0xa3 frame (the BIA unlock handshake is
+      // either rejected or the firmware never measures impedance at all).
+      // In that case the bytes are zero and we still emit a BIA payload
+      // — the calculator degrades gracefully to weight+demographics
+      // estimates so the page can leave the "Calculating body
+      // composition" placeholder instead of hanging forever waiting for
+      // a follow-up packet that will never arrive.
       int impedance = 0;
       if (data.length >= 10) {
         impedance = (data[8].toInt() << 8) | data[9].toInt();
       }
 
-      if (impedance > 0) {
-        _calculateAndEmitBia(weight, impedance, heartRate: heartRate);
-      } else {
-        _emitRtData(weight, true, heartRate: heartRate);
-      }
+      _calculateAndEmitBia(
+        weight,
+        impedance,
+        heartRate: heartRate,
+        impedanceMeasured: impedance > 0,
+      );
     } else if (type == 0x51) {
       // DEDICATED HEART RATE PACKET (F4 Variant)
       // Usually: AB 51 HR CS
@@ -301,6 +309,7 @@ class LescaleController {
     double weight,
     int impedance, {
     int? heartRate,
+    bool impedanceMeasured = true,
   }) {
     // If impedance seems like it's swapped (too high), swap it
     if (impedance > 10000) {
@@ -321,6 +330,7 @@ class LescaleController {
       'deviceType': 'scale',
       'weightKg': weight.toStringAsFixed(2),
       'impedance': impedance,
+      'impedanceMeasured': impedanceMeasured,
       if (heartRate != null && heartRate > 0) 'heartRate': heartRate,
       'isLocked': true,
       ...report,
