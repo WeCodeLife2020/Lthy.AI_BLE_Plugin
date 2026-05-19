@@ -70,6 +70,7 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
                                        CBCentralManagerDelegate,
                                        CBPeripheralDelegate,
                                        VTMURATDeviceDelegate,
+                                       VTMURATDeviceExtension,
                                        VTMURATUtilsDelegate,
                                        VTO2CommunicateDelegate
 #if FBD_HAS_ICOMON
@@ -1252,6 +1253,26 @@ static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
         VTMURATUtils *util = [VTMURATUtils new];
         util.delegate = self;
         util.deviceDelegate = self;
+        // ── VTMURATDeviceExtension hook ──
+        // VTMProductLib 1.5 only knows a small set of device-name
+        // prefixes natively (e.g. "PF-10BWS" for FOxi, "O2 S " for
+        // WOxi). When a peripheral advertises a related but
+        // not-yet-recognised name — most notably the **PF-10AW /
+        // PF-10AW1 / PF-10BW / PF-10BW1** finger-clip oximeters,
+        // which use the same FOxi GATT profile as PF-10BWS but a
+        // different `CBAdvertisementDataLocalNameKey` — the SDK's
+        // service-discovery state machine cannot match the
+        // peripheral's services and fires `utilDeployFailed:` with
+        // an unhelpful "services or characteristics not
+        // discoverable" log. Setting `util.extension = self` lets
+        // us answer `extensionNamePrefixsWithType:` and feed in the
+        // extra prefixes; the SDK then completes deploy normally
+        // and `utilDeployCompletion:` fires.
+        //
+        // MUST be set BEFORE assigning `peripheral` because the SDK
+        // reads the extension during the synchronous service-discovery
+        // setup triggered by the peripheral assignment.
+        util.extension = self;
         if (advData) util.advertisementData = advData;
         util.peripheral = peripheral;
         self.uratUtil = util;
@@ -1302,6 +1323,49 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
                       @"reason": error.localizedDescription ?: @"user_initiated"}];
 }
 
+#pragma mark - VTMURATDeviceExtension
+
+/// Hand the SDK extra `CBAdvertisementDataLocalNameKey` prefixes for
+/// a given device family. VTMProductLib 1.5 ships a hard-coded
+/// recogniser that only knows a subset of the names a particular
+/// SDK family covers (e.g. for `VTMDeviceTypeFOxi` it natively
+/// recognises only `"PF-10BWS"`, even though the same FOxi GATT
+/// profile is used by the wider PF-10AW / PF-10BW family). When the
+/// peripheral's advertised name is outside that hard-coded list,
+/// the SDK fails service discovery with `utilDeployFailed:` and the
+/// connection drops with the misleading "services or characteristics
+/// not discoverable" log.
+///
+/// We supplement the SDK's built-in list here. Returning a richer
+/// set is harmless — the SDK only consults it when its own
+/// classifier comes up empty, so we cannot accidentally upgrade an
+/// already-recognised peripheral to the wrong profile.
+///
+/// Prefixes are matched case-insensitively by the SDK and the
+/// peripheral's advertised name typically arrives in upper-case
+/// (`"PF-10AW"`); returning the canonical upper-case forms keeps
+/// the intent obvious for any developer reading this list later.
+- (NSArray<NSString *> *)extensionNamePrefixsWithType:(VTMDeviceType)deviceType {
+    switch (deviceType) {
+        case VTMDeviceTypeFOxi:
+            // Order: longest / most-specific first so the SDK's
+            // first-prefix-wins matcher doesn't classify a
+            // "PF-10AW1" device as a bare "PF-10AW".
+            return @[@"PF-10AW1", @"PF-10AW_1", @"PF-10AW",
+                     @"PF-10BW1", @"PF-10BW", @"PF-10",
+                     @"PF10AW1", @"PF10AW_1", @"PF10AW",
+                     @"PF10BW1", @"PF10BW", @"PF10"];
+        case VTMDeviceTypeWOxi:
+            // O2Ring S advertises as either "O2 S" or "O2RING S"
+            // depending on firmware build. The SDK natively only
+            // looks for "O2 S "; the no-trailing-space and
+            // hyphen-less variants are added here for safety.
+            return @[@"O2RING S", @"O2-RING S", @"O2 S", @"O2S"];
+        default:
+            return nil;
+    }
+}
+
 #pragma mark - VTMURATDeviceDelegate  (URAT / WOxi / FOxi / ...)
 
 - (void)utilDeployCompletion:(VTMURATUtils *)util {
@@ -1315,6 +1379,67 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
                       @"model": @(self.connectedModel),
                       @"family": self.activeMapping.family,
                       @"deviceType": self.activeMapping.deviceType}];
+
+    // Mirror the Lepu Android SDK's auto-stream behaviour for device
+    // families whose firmware does NOT push real-time samples until
+    // the host explicitly asks. On Android, `BleServiceHelper` enables
+    // the notify characteristic during its connect routine and the
+    // device starts streaming immediately; on iOS, VTMProductLib is a
+    // passive wrapper around CoreBluetooth and only sends the "begin
+    // streaming" opcode when the app calls the family-specific
+    // `*_make*Send:YES` / `*_request*RealData` helper.
+    //
+    // The home-page pulse-oximeter screen (and any screen that mirrors
+    // its UX) deliberately does NOT call `startMeasurement()` after
+    // connecting — it expects the device to start pushing as soon as
+    // it has a finger inserted, the same way the Android build behaves.
+    // Without this auto-start, an iOS PF-10AW completes service
+    // discovery, fires `connectionState: connected`, and then sits
+    // idle forever because nothing told the device to send samples.
+    [self autoStartRealtimeForFamily];
+}
+
+/// Issue the family-specific "begin streaming" command immediately
+/// after deploy completes for device families whose firmware does
+/// not push without it. Currently this covers:
+///
+///   • `VTMDeviceTypeFOxi`  — finger-clip oximeters (PF-10AW / PF-10BWS).
+///                            Needs `foxi_makeInfoSend:YES` for the
+///                            per-sample SpO2/PR struct and
+///                            `foxi_makeWaveSend:YES` for the PPG
+///                            waveform.
+///   • `VTMDeviceTypeWOxi`  — wearable oximeters (O2Ring S). Needs
+///                            an `observeParameters:waveform:` opt-in
+///                            followed by `woxi_requestWOxiRealData`.
+///
+/// Other families are intentionally left alone:
+///   • ECG / BP / Scale / ER3 / MSeries / BabyPatch — their UI
+///     screens DO call `startMeasurement()` explicitly and either
+///     need to send a measurement-mode command first (BP cuff
+///     inflate / ECG enter-measurement) or auto-stream by design
+///     once the user starts the cuff. Auto-starting here would
+///     bypass the screen's state machine.
+///   • Legacy O2Ring (VTO2Communicate) — handled separately in
+///     `o2_serviceDeployed:`; the SDK pushes parameters by default.
+- (void)autoStartRealtimeForFamily {
+    VTMDeviceMapping *m = self.activeMapping;
+    if (m == nil) return;
+    switch (m.vtmDeviceType) {
+        case VTMDeviceTypeFOxi:
+            FBD_LOG(@"auto-start FOxi RT for model=%ld", (long)m.lepuModel);
+            [self.uratUtil foxi_makeInfoSend:YES];
+            [self.uratUtil foxi_makeWaveSend:YES];
+            self.measuring = YES;
+            break;
+        case VTMDeviceTypeWOxi:
+            FBD_LOG(@"auto-start WOxi RT for model=%ld", (long)m.lepuModel);
+            [self.uratUtil observeParameters:YES waveform:YES rawdata:NO accdata:NO];
+            [self.uratUtil woxi_requestWOxiRealData];
+            self.measuring = YES;
+            break;
+        default:
+            break;
+    }
 }
 
 - (void)utilDeployFailed:(VTMURATUtils *)util {
