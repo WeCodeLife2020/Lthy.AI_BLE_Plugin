@@ -24,10 +24,27 @@
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <VTMProductLib/VTMProductLib.h>
 
-// Nordic UART service used by the Viatom AirBP / SmartBP.
+// Nordic UART Service (NUS) — shared by TWO unrelated Viatom/Wellue
+// protocols that both ride the standard Nordic GATT profile but with
+// different framing on top:
+//
+//   • Viatom AirBP / SmartBP blood-pressure monitor — uses 0xA5-framed
+//     URAT-style packets parsed by `VTAirBPPacket`.
+//   • Wellue PC-60FW family fingertip oximeters (PF-10AW / PF-10AW1 /
+//     PF-10BW / PF-10BW1, Lepu ids 85–88) — uses an `0xAA 0x55` synced
+//     + CRC8/MAXIM framed packet stream where the device auto-pushes
+//     SpO2/PR/PI samples once the TX-notify characteristic is enabled.
+//     Reference: github.com/sza2/viatom_pc60fw README (the only public
+//     write-up of this protocol).
+//
+// The `kAirBP*` names are kept for back-compat with existing call sites;
+// `kPC60Fw*` aliases below make the PC60Fw code self-documenting.
 static NSString *const kAirBPServiceUUID = @"6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 static NSString *const kAirBPTxCharUUID  = @"6E400002-B5A3-F393-E0A9-E50E24DCCA9E"; // phone → device (write)
 static NSString *const kAirBPRxCharUUID  = @"6E400003-B5A3-F393-E0A9-E50E24DCCA9E"; // device → phone (notify)
+#define kPC60FwServiceUUID    kAirBPServiceUUID
+#define kPC60FwTxCharUUID     kAirBPTxCharUUID
+#define kPC60FwRxNotifyUUID   kAirBPRxCharUUID
 
 // iComon scale SDK (vendored under ios/Frameworks/).
 //
@@ -108,6 +125,18 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
 @property (nonatomic, strong) CBCharacteristic *airBPTxChar;
 @property (nonatomic, strong) CBCharacteristic *airBPRxChar;
 @property (nonatomic, strong) NSMutableData    *airBPRxBuffer;
+
+// PC60Fw state (when activeMapping.protocolPath == VTMProtocolPathPC60Fw)
+//
+// The TX/notify characteristic is the only one the device actually
+// uses — the firmware streams real-time SpO2/PR/PI/waveform packets
+// the moment notifications are enabled, with no app-side opcode
+// required. We still capture the write characteristic for parity
+// with the AirBP path in case a future firmware revision adds
+// optional configuration writes.
+@property (nonatomic, strong) CBCharacteristic *pc60FwTxChar;
+@property (nonatomic, strong) CBCharacteristic *pc60FwRxChar;
+@property (nonatomic, strong) NSMutableData    *pc60FwRxBuffer;
 
 // In-progress URAT file download (BP2 / ER1 / ER2 / WOxi / FOxi / ER3 / MSeries).
 // The URAT protocol is three-step: prepareReadFile → readFile:offset (chunked) →
@@ -665,6 +694,17 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
         result(@YES);
         return;
     }
+    if (m.protocolPath == VTMProtocolPathPC60Fw) {
+        // PC-60FW family auto-streams as soon as the Nordic UART notify
+        // characteristic is enabled at deploy time. There is no explicit
+        // "begin streaming" opcode in the protocol — the device is
+        // already pushing SpO2/PR/PI/waveform packets when this Dart
+        // call lands. Mark `measuring` so symmetric `stopMeasurement`
+        // semantics are preserved on the Dart side.
+        self.measuring = YES;
+        result(@YES);
+        return;
+    }
     if (m.protocolPath == VTMProtocolPathO2Legacy) {
         [self.o2Util beginGetRealData];
         [self.o2Util beginGetRealWave];
@@ -767,6 +807,17 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     }
     if (m.protocolPath == VTMProtocolPathAirBP) {
         [self writeAirBPCommand:VTAirBPCmdStopMeasure payload:nil];
+        result(@YES);
+        return;
+    }
+    if (m.protocolPath == VTMProtocolPathPC60Fw) {
+        // No "stop streaming" opcode is documented for the PC-60FW
+        // protocol — the device only stops when notifications are
+        // disabled or the link drops. We can't unsubscribe without
+        // tearing down the connection, so this is a no-op that just
+        // clears the local `measuring` flag for parity with the AirBP
+        // and URAT paths.
+        self.measuring = NO;
         result(@YES);
         return;
     }
@@ -882,6 +933,19 @@ static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
         result(@YES);
         return;
     }
+    if (m.protocolPath == VTMProtocolPathPC60Fw) {
+        // PC-60FW exposes its hardware/firmware revision via the
+        // 0xF0-header metadata frames the device pushes spontaneously
+        // after subscribe (see drainPC60FwBuffer), not via a request /
+        // response API. There's no opcode to ask for it on demand, so
+        // we surface UNSUPPORTED here rather than silently dropping
+        // the call — the Dart layer should listen on the `raw` event
+        // stream if it really needs to see those metadata frames.
+        result([FlutterError errorWithCode:@"UNSUPPORTED"
+                                   message:@"PC-60FW family pushes device info passively; no request API."
+                                   details:nil]);
+        return;
+    }
     if (m.protocolPath == VTMProtocolPathO2Legacy) {
         [self.o2Util beginGetInfo];
     } else {
@@ -902,6 +966,15 @@ static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
     if (m.protocolPath == VTMProtocolPathAirBP) {
         result([FlutterError errorWithCode:@"UNSUPPORTED"
                                    message:@"AirBP historical-record browsing is not wired yet."
+                                   details:nil]);
+        return;
+    }
+    if (m.protocolPath == VTMProtocolPathPC60Fw) {
+        // PC-60FW oximeters don't expose on-device flash storage —
+        // historical recordings live in the companion phone app's DB,
+        // not on the device. There's no file-list opcode to call.
+        result([FlutterError errorWithCode:@"UNSUPPORTED"
+                                   message:@"PC-60FW family has no on-device file storage."
                                    details:nil]);
         return;
     }
@@ -1073,6 +1146,12 @@ static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
                                    details:nil]);
         return;
     }
+    if (m.protocolPath == VTMProtocolPathPC60Fw) {
+        result([FlutterError errorWithCode:@"UNSUPPORTED"
+                                   message:@"PC-60FW family has no on-device file storage."
+                                   details:nil]);
+        return;
+    }
     if (self.pendingReadFileName != nil) {
         result([FlutterError errorWithCode:@"BUSY"
                                    message:@"A file read is already in progress; wait for fileReadComplete or disconnect."
@@ -1140,6 +1219,14 @@ static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
                                    details:nil]);
         return;
     }
+    if (m.protocolPath == VTMProtocolPathPC60Fw) {
+        // The PC-60FW protocol has no documented factory-reset opcode;
+        // the device's reset is a hardware button (long-press power).
+        result([FlutterError errorWithCode:@"UNSUPPORTED"
+                                   message:@"Factory reset is not exposed by the PC-60FW protocol."
+                                   details:nil]);
+        return;
+    }
     if (m.protocolPath == VTMProtocolPathO2Legacy) {
         [self.o2Util beginFactory];
     } else {
@@ -1199,7 +1286,9 @@ static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
     self.advData[uuid]    = advertisementData;
     self.mappings[uuid]   = mapping;
 
-    NSString *sdkLabel = (mapping.protocolPath == VTMProtocolPathAirBP) ? @"airbp" : @"lepu";
+    NSString *sdkLabel = @"lepu";
+    if (mapping.protocolPath == VTMProtocolPathAirBP)       sdkLabel = @"airbp";
+    else if (mapping.protocolPath == VTMProtocolPathPC60Fw) sdkLabel = @"pc60fw";
     [self sendEvent:@{@"event": @"deviceFound",
                       @"name":  name ?: @"",
                       @"mac":   uuid,
@@ -1225,6 +1314,24 @@ static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
         self.o2Util   = nil;
         self.airBPRxBuffer = [NSMutableData data];
         [peripheral discoverServices:@[[CBUUID UUIDWithString:kAirBPServiceUUID]]];
+        return;
+    }
+
+    if (m.protocolPath == VTMProtocolPathPC60Fw) {
+        // PC-60FW family oximeters (PF-10AW etc.) also ride Nordic UART
+        // (same 6E400001 service as AirBP) but with a totally different
+        // 0xAA55-synced + CRC8/MAXIM packet framing on top. VTMProductLib
+        // has no support for this profile — `VTMURATUtils` only knows
+        // the URAT 0xA5 framing on the proprietary E8FB0001 service and
+        // immediately fires `utilDeployFailed` against a PC60Fw device.
+        // So we drive the peripheral directly via CoreBluetooth, exactly
+        // like the AirBP path, and hand any incoming bytes to our own
+        // `drainPC60FwBuffer` reassembler.
+        peripheral.delegate = self;
+        self.uratUtil       = nil;
+        self.o2Util         = nil;
+        self.pc60FwRxBuffer = [NSMutableData data];
+        [peripheral discoverServices:@[[CBUUID UUIDWithString:kPC60FwServiceUUID]]];
         return;
     }
 
@@ -1318,6 +1425,9 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
     self.airBPTxChar      = nil;
     self.airBPRxChar      = nil;
     self.airBPRxBuffer    = nil;
+    self.pc60FwTxChar     = nil;
+    self.pc60FwRxChar     = nil;
+    self.pc60FwRxBuffer   = nil;
     [self sendEvent:@{@"event": @"connectionState",
                       @"state": @"disconnected",
                       @"reason": error.localizedDescription ?: @"user_initiated"}];
@@ -1327,34 +1437,29 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
 
 /// Hand the SDK extra `CBAdvertisementDataLocalNameKey` prefixes for
 /// a given device family. VTMProductLib 1.5 ships a hard-coded
-/// recogniser that only knows a subset of the names a particular
-/// SDK family covers (e.g. for `VTMDeviceTypeFOxi` it natively
-/// recognises only `"PF-10BWS"`, even though the same FOxi GATT
-/// profile is used by the wider PF-10AW / PF-10BW family). When the
-/// peripheral's advertised name is outside that hard-coded list,
-/// the SDK fails service discovery with `utilDeployFailed:` and the
-/// connection drops with the misleading "services or characteristics
+/// recogniser that only knows the canonical name for each family
+/// (e.g. `"PF-10BWS"` for FOxi, `"O2 S"` for WOxi). When a
+/// peripheral advertises a related name that uses the same GATT
+/// profile but isn't in the SDK's table, deploy fails with
+/// `utilDeployFailed:` and a misleading "services or characteristics
 /// not discoverable" log.
 ///
-/// We supplement the SDK's built-in list here. Returning a richer
-/// set is harmless — the SDK only consults it when its own
-/// classifier comes up empty, so we cannot accidentally upgrade an
-/// already-recognised peripheral to the wrong profile.
-///
-/// Prefixes are matched case-insensitively by the SDK and the
-/// peripheral's advertised name typically arrives in upper-case
-/// (`"PF-10AW"`); returning the canonical upper-case forms keeps
-/// the intent obvious for any developer reading this list later.
+/// We supplement the SDK's built-in list here, but ONLY for names
+/// that genuinely share the SDK family's GATT profile. The older
+/// PF-10AW / PF-10AW1 / PF-10BW / PF-10BW1 (Lepu ids 85–88) look
+/// like FOxi peers by name but actually use the unrelated PC60FW
+/// Nordic-UART profile; those are routed to `VTMProtocolPathPC60Fw`
+/// in the device-type mapper and intentionally excluded here.
 - (NSArray<NSString *> *)extensionNamePrefixsWithType:(VTMDeviceType)deviceType {
     switch (deviceType) {
         case VTMDeviceTypeFOxi:
-            // Order: longest / most-specific first so the SDK's
-            // first-prefix-wins matcher doesn't classify a
-            // "PF-10AW1" device as a bare "PF-10AW".
-            return @[@"PF-10AW1", @"PF-10AW_1", @"PF-10AW",
-                     @"PF-10BW1", @"PF-10BW", @"PF-10",
-                     @"PF10AW1", @"PF10AW_1", @"PF10AW",
-                     @"PF10BW1", @"PF10BW", @"PF10"];
+            // The SDK natively recognises "PF-10BWS" (id 126). The
+            // sibling "PF-10AW_1" (underscore-one, id 123) shares the
+            // FOxi GATT profile but isn't in the built-in list, so we
+            // register it here. Both upper- and unhyphenated variants
+            // are included because the firmware build varies the
+            // local-name format across hardware revisions.
+            return @[@"PF-10AW_1", @"PF10AW_1", @"PF-10BWS", @"PF10BWS"];
         case VTMDeviceTypeWOxi:
             // O2Ring S advertises as either "O2 S" or "O2RING S"
             // depending on firmware build. The SDK natively only
@@ -1403,8 +1508,9 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
 /// after deploy completes for device families whose firmware does
 /// not push without it. Currently this covers:
 ///
-///   • `VTMDeviceTypeFOxi`  — finger-clip oximeters (PF-10AW / PF-10BWS).
-///                            Needs `foxi_makeInfoSend:YES` for the
+///   • `VTMDeviceTypeFOxi`  — newer finger-clip oximeters (PF-10AW_1
+///                            id 123 / PF-10BWS id 126). Needs
+///                            `foxi_makeInfoSend:YES` for the
 ///                            per-sample SpO2/PR struct and
 ///                            `foxi_makeWaveSend:YES` for the PPG
 ///                            waveform.
@@ -1421,6 +1527,11 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
 ///     bypass the screen's state machine.
 ///   • Legacy O2Ring (VTO2Communicate) — handled separately in
 ///     `o2_serviceDeployed:`; the SDK pushes parameters by default.
+///   • PC60Fw family (PF-10AW etc., ids 85–88) — handled outside this
+///     callback because they don't go through VTMURATUtils at all.
+///     The PC60Fw firmware streams the moment the Nordic-UART notify
+///     characteristic is enabled (see `didUpdateNotificationStateFor…`
+///     for VTMProtocolPathPC60Fw), so no opcode is needed.
 - (void)autoStartRealtimeForFamily {
     VTMDeviceMapping *m = self.activeMapping;
     if (m == nil) return;
@@ -2549,13 +2660,22 @@ commandCompletion:(u_char)cmdType
 }
 #endif  // FBD_HAS_ICOMON
 
-#pragma mark - AirBP — CBPeripheralDelegate (Nordic UART)
+#pragma mark - Nordic UART — CBPeripheralDelegate (AirBP & PC60Fw)
+//
+// Both `VTMProtocolPathAirBP` (Viatom AirBP / SmartBP) and
+// `VTMProtocolPathPC60Fw` (Wellue PC-60FW oximeters: PF-10AW etc.)
+// ride the standard Nordic UART Service. We keep them in a single
+// CBPeripheralDelegate codepath for service/characteristic discovery
+// (the GATT layer is identical) and only branch where the framing
+// or downstream handling differs.
 
 - (void)peripheral:(CBPeripheral *)peripheral didDiscoverServices:(NSError *)error {
-    if (self.activeMapping.protocolPath != VTMProtocolPathAirBP) return;
+    VTMProtocolPath path = self.activeMapping.protocolPath;
+    if (path != VTMProtocolPathAirBP && path != VTMProtocolPathPC60Fw) return;
+    NSString *tag = (path == VTMProtocolPathAirBP) ? @"AirBP" : @"PC60Fw";
     if (error) {
         [self cancelConnectionWatchdog];
-        FBD_LOG(@"AirBP discoverServices failed: %@", error.localizedDescription);
+        FBD_LOG(@"%@ discoverServices failed: %@", tag, error.localizedDescription);
         [self sendEvent:@{@"event": @"connectionState",
                           @"state": @"disconnected",
                           @"reason": error.localizedDescription ?: @"discover_services_failed"}];
@@ -2570,19 +2690,23 @@ commandCompletion:(u_char)cmdType
         }
     }
     [self cancelConnectionWatchdog];
-    FBD_LOG(@"AirBP service %@ not advertised by peripheral", kAirBPServiceUUID);
+    FBD_LOG(@"%@ service %@ not advertised by peripheral", tag, kAirBPServiceUUID);
     [self sendEvent:@{@"event": @"connectionState",
                       @"state": @"disconnected",
-                      @"reason": @"airbp_service_not_found"}];
+                      @"reason": (path == VTMProtocolPathAirBP)
+                          ? @"airbp_service_not_found"
+                          : @"pc60fw_service_not_found"}];
 }
 
 - (void)peripheral:(CBPeripheral *)peripheral
 didDiscoverCharacteristicsForService:(CBService *)service
              error:(NSError *)error {
-    if (self.activeMapping.protocolPath != VTMProtocolPathAirBP) return;
+    VTMProtocolPath path = self.activeMapping.protocolPath;
+    if (path != VTMProtocolPathAirBP && path != VTMProtocolPathPC60Fw) return;
+    NSString *tag = (path == VTMProtocolPathAirBP) ? @"AirBP" : @"PC60Fw";
     if (error) {
         [self cancelConnectionWatchdog];
-        FBD_LOG(@"AirBP discoverCharacteristics failed: %@", error.localizedDescription);
+        FBD_LOG(@"%@ discoverCharacteristics failed: %@", tag, error.localizedDescription);
         [self sendEvent:@{@"event": @"connectionState",
                           @"state": @"disconnected",
                           @"reason": error.localizedDescription ?: @"discover_chars_failed"}];
@@ -2590,9 +2714,17 @@ didDiscoverCharacteristicsForService:(CBService *)service
     }
     for (CBCharacteristic *ch in service.characteristics) {
         if ([ch.UUID.UUIDString caseInsensitiveCompare:kAirBPTxCharUUID] == NSOrderedSame) {
-            self.airBPTxChar = ch;
+            if (path == VTMProtocolPathAirBP) {
+                self.airBPTxChar = ch;
+            } else {
+                self.pc60FwTxChar = ch;
+            }
         } else if ([ch.UUID.UUIDString caseInsensitiveCompare:kAirBPRxCharUUID] == NSOrderedSame) {
-            self.airBPRxChar = ch;
+            if (path == VTMProtocolPathAirBP) {
+                self.airBPRxChar = ch;
+            } else {
+                self.pc60FwRxChar = ch;
+            }
             [peripheral setNotifyValue:YES forCharacteristic:ch];
         }
     }
@@ -2601,11 +2733,13 @@ didDiscoverCharacteristicsForService:(CBService *)service
 - (void)peripheral:(CBPeripheral *)peripheral
 didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)characteristic
              error:(NSError *)error {
-    if (self.activeMapping.protocolPath != VTMProtocolPathAirBP) return;
+    VTMProtocolPath path = self.activeMapping.protocolPath;
+    if (path != VTMProtocolPathAirBP && path != VTMProtocolPathPC60Fw) return;
     if ([characteristic.UUID.UUIDString caseInsensitiveCompare:kAirBPRxCharUUID] != NSOrderedSame) return;
+    NSString *tag = (path == VTMProtocolPathAirBP) ? @"AirBP" : @"PC60Fw";
     if (error) {
         [self cancelConnectionWatchdog];
-        FBD_LOG(@"AirBP subscribe failed: %@", error.localizedDescription);
+        FBD_LOG(@"%@ subscribe failed: %@", tag, error.localizedDescription);
         [self sendEvent:@{@"event": @"connectionState",
                           @"state": @"disconnected",
                           @"reason": error.localizedDescription ?: @"subscribe_failed"}];
@@ -2615,24 +2749,33 @@ didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)characteristic
     [self cancelConnectionWatchdog];
     self.serviceDeployed = YES;
     self.connectedModel  = self.activeMapping.lepuModel;
-    FBD_LOG(@"AirBP deploy complete model=%ld", (long)self.connectedModel);
+    NSString *defaultFamily   = (path == VTMProtocolPathAirBP) ? @"airbp"    : @"pc60fw";
+    NSString *defaultDevType  = (path == VTMProtocolPathAirBP) ? @"bp"       : @"oximeter";
+    NSString *sdkLabel        = (path == VTMProtocolPathAirBP) ? @"airbp"    : @"pc60fw";
+    FBD_LOG(@"%@ deploy complete model=%ld", tag, (long)self.connectedModel);
     [self sendEvent:@{@"event": @"connectionState",
                       @"state": @"connected",
                       @"model": @(self.connectedModel),
-                      @"family": self.activeMapping.family ?: @"airbp",
-                      @"deviceType": self.activeMapping.deviceType ?: @"bp",
-                      @"sdk": @"airbp"}];
+                      @"family": self.activeMapping.family ?: defaultFamily,
+                      @"deviceType": self.activeMapping.deviceType ?: defaultDevType,
+                      @"sdk": sdkLabel}];
 }
 
 - (void)peripheral:(CBPeripheral *)peripheral
 didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic
              error:(NSError *)error {
-    if (self.activeMapping.protocolPath != VTMProtocolPathAirBP) return;
+    VTMProtocolPath path = self.activeMapping.protocolPath;
+    if (path != VTMProtocolPathAirBP && path != VTMProtocolPathPC60Fw) return;
     if (error || characteristic.value.length == 0) return;
     if ([characteristic.UUID.UUIDString caseInsensitiveCompare:kAirBPRxCharUUID] != NSOrderedSame) return;
 
-    [self.airBPRxBuffer appendData:characteristic.value];
-    [self drainAirBPBuffer];
+    if (path == VTMProtocolPathAirBP) {
+        [self.airBPRxBuffer appendData:characteristic.value];
+        [self drainAirBPBuffer];
+    } else {
+        [self.pc60FwRxBuffer appendData:characteristic.value];
+        [self drainPC60FwBuffer];
+    }
 }
 
 #pragma mark - AirBP — helpers
@@ -2770,6 +2913,188 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic
                               @"sdk":     @"airbp",
                               @"mac":     mac,
                               @"cmdType": @(cmd),
+                              @"data":    [payload base64EncodedStringWithOptions:0]}];
+            break;
+        }
+    }
+}
+
+#pragma mark - PC60Fw — helpers (Wellue PF-10AW family)
+//
+// PC-60FW packet framing — the only public reference is
+// github.com/sza2/viatom_pc60fw which captured the protocol from a
+// Wellue PC-60FW oximeter (same firmware family as PF-10AW). The
+// device pushes frames over the Nordic UART notify characteristic
+// with no app-side opcode required:
+//
+//   ┌─────┬─────┬───────┬────────┬───────────┬──────┐
+//   │ AA  │ 55  │ HDR   │ LEN    │ PAYLOAD   │ CRC  │
+//   ├─────┼─────┼───────┼────────┼───────────┼──────┤
+//   │  1B │ 1B  │  1B   │  1B    │ LEN-1 B   │  1B  │
+//   └─────┴─────┴───────┴────────┴───────────┴──────┘
+//             ^         ^        ^                  ^
+//             |         |        |                  |
+//             |         |        +--- payload[0] = func code
+//             |         +--- length INCLUDING trailing CRC
+//             +--- 0x0F (data frames) or 0xF0 (metadata)
+//
+// CRC8/MAXIM (poly 0x31 reflected = 0x8C, init 0x00, no final XOR).
+// For a valid frame, CRC over the entire packet (including the CRC
+// byte) equals 0 — the standard "tag-check" form.
+//
+// Function codes observed:
+//   0x01 (HDR=0x0F) — SpO2 / PR / PI numerical sample (~1 Hz)
+//                     payload: [func, SpO2, PR, ?, ?, PI*10, ?, ?]
+//   0x02 (HDR=0x0F) — pulse waveform (5 samples per packet, ~60 Hz)
+//                     payload: [func, w1, w2, w3, w4, w5]
+//                     One sample per cycle has bit 7 set (subtract
+//                     0x80 to fit into the 0..0x7F PPG range).
+//   0x03 (HDR=0xF0) — unknown 1-byte heartbeat — ignored.
+//   0x21 (HDR=0x0F) — unknown — ignored.
+
+static uint8_t fbd_crc8_maxim(const uint8_t *data, NSUInteger len) {
+    // CRC-8/MAXIM (a.k.a. Dallas/1-Wire). Reflected poly 0x8C.
+    uint8_t crc = 0x00;
+    for (NSUInteger i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            crc = (crc & 0x01) ? (uint8_t)((crc >> 1) ^ 0x8C) : (uint8_t)(crc >> 1);
+        }
+    }
+    return crc;
+}
+
+/// Drain the rolling RX buffer, emitting one event per well-formed
+/// frame. Partial frames at the tail stay in the buffer for the next
+/// notification. Sync re-acquisition discards bytes up to the next
+/// `0xAA` so a CRC failure or a stray byte doesn't desynchronise the
+/// stream forever.
+- (void)drainPC60FwBuffer {
+    while (self.pc60FwRxBuffer.length >= 4) {     // need at least sync+hdr+len
+        const uint8_t *p = self.pc60FwRxBuffer.bytes;
+        // Resynchronise on the 0xAA 0x55 sync word.
+        if (p[0] != 0xAA || p[1] != 0x55) {
+            // Hunt for the next 0xAA. If absent, drop the buffer.
+            NSRange hdr = [self.pc60FwRxBuffer rangeOfData:[NSData dataWithBytes:"\xAA" length:1]
+                                                  options:0
+                                                    range:NSMakeRange(1, self.pc60FwRxBuffer.length - 1)];
+            if (hdr.location == NSNotFound) {
+                [self.pc60FwRxBuffer setLength:0];
+                return;
+            }
+            [self.pc60FwRxBuffer replaceBytesInRange:NSMakeRange(0, hdr.location)
+                                            withBytes:NULL length:0];
+            continue;
+        }
+        // p[2] = header (0x0F or 0xF0); p[3] = length (payload+CRC)
+        uint8_t header  = p[2];
+        uint8_t length  = p[3];
+        NSUInteger frameLen = 4 + length;
+        if (self.pc60FwRxBuffer.length < frameLen) return;  // need more bytes
+
+        // Full frame in hand — verify CRC8/MAXIM over the entire frame.
+        // For a valid frame the trailing CRC byte makes the running
+        // CRC fold back to zero.
+        if (fbd_crc8_maxim(p, frameLen) != 0) {
+            // Drop just the leading sync byte and re-hunt — keeps us
+            // in lock-step even if a single bit-flip corrupted one
+            // packet.
+            [self.pc60FwRxBuffer replaceBytesInRange:NSMakeRange(0, 1)
+                                            withBytes:NULL length:0];
+            continue;
+        }
+        if (length < 2) {
+            // Pathological: length too small to even contain a func + CRC.
+            [self.pc60FwRxBuffer replaceBytesInRange:NSMakeRange(0, frameLen)
+                                            withBytes:NULL length:0];
+            continue;
+        }
+        // Slice out payload (excludes trailing CRC).
+        NSData *payload = [self.pc60FwRxBuffer subdataWithRange:NSMakeRange(4, length - 1)];
+        [self.pc60FwRxBuffer replaceBytesInRange:NSMakeRange(0, frameLen)
+                                        withBytes:NULL length:0];
+        [self handlePC60FwFrameHeader:header payload:payload];
+    }
+}
+
+- (void)handlePC60FwFrameHeader:(uint8_t)header payload:(NSData *)payload {
+    if (payload.length < 1) return;
+    const uint8_t *p = payload.bytes;
+    uint8_t func = p[0];
+    NSString *mac = self.activePeripheral.identifier.UUIDString ?: @"";
+    NSString *fam = self.activeMapping.family ?: @"pc60fw";
+
+    switch (func) {
+        case 0x01: {
+            // Numerical SpO2/PR/PI sample. Layout (after func byte):
+            //   payload[1] = SpO2  (0..100, 0xFF = invalid / probe off)
+            //   payload[2] = PR    (0..250, 0xFF = invalid)
+            //   payload[3] = unknown / status flags
+            //   payload[4] = PI * 10 (so 0x50 → 8.0, 0xFF = invalid)
+            //   payload[5] = unknown
+            //   payload[6] = unknown
+            // We need at least 5 bytes (func + spo2 + pr + ? + pi).
+            if (payload.length < 5) return;
+            uint8_t spo2Raw = p[1];
+            uint8_t prRaw   = p[2];
+            uint8_t piRaw   = p[4];
+
+            // The Wellue firmware uses 0xFF as the "invalid" sentinel
+            // (probe off, finger out of clip, sensor losing pulse).
+            // Mirror the Lepu Android `RtParam` semantics by surfacing
+            // a NaN-sentinel of -1 so the Dart layer's existing
+            // probe-off heuristic (`spo2 < 50`) keeps working without
+            // changes. PI gets 0.0 since negative PI is meaningless.
+            BOOL probeOff = (spo2Raw == 0xFF) || (prRaw == 0xFF);
+            BOOL pulseSearching = !probeOff && (spo2Raw == 0x7F || prRaw == 0x7F);
+            int spo2 = probeOff ? -1 : (int)spo2Raw;
+            int pr   = probeOff ? -1 : (int)prRaw;
+            float pi = (piRaw == 0xFF) ? 0.0f : (piRaw / 10.0f);
+
+            [self sendEvent:@{@"event":            @"rtData",
+                              @"deviceType":       @"oximeter",
+                              @"deviceFamily":     fam,
+                              @"sdk":              @"pc60fw",
+                              @"mac":              mac,
+                              @"model":            @(self.connectedModel),
+                              @"spo2":             @(spo2),
+                              @"pr":               @(pr),
+                              @"pi":               @(pi),
+                              @"isProbeOff":       @(probeOff),
+                              @"isPulseSearching": @(pulseSearching)}];
+            break;
+        }
+        case 0x02: {
+            // Pulse waveform — payload is `func` + N waveform samples.
+            // Each sample is in the 0..0x7F PPG range; ONE sample per
+            // pulse cycle (the third sample after the peak) has its
+            // top bit set as a "spike marker". We fold spikes back
+            // into range by clearing bit 7 — matches the Python
+            // reference implementation (sza2/viatom_pc60fw README).
+            if (payload.length < 2) return;
+            NSMutableArray<NSNumber *> *samples = [NSMutableArray arrayWithCapacity:payload.length - 1];
+            for (NSUInteger i = 1; i < payload.length; i++) {
+                uint8_t s = p[i] & 0x7F;
+                [samples addObject:@(s)];
+            }
+            [self sendEvent:@{@"event":        @"rtWaveform",
+                              @"deviceType":   @"oximeter",
+                              @"deviceFamily": fam,
+                              @"sdk":          @"pc60fw",
+                              @"mac":          mac,
+                              @"model":        @(self.connectedModel),
+                              @"waveData":     samples}];
+            break;
+        }
+        default: {
+            // Surface unknown frames as `raw` so future protocol
+            // additions are visible to the Dart layer without
+            // requiring an iOS plugin update first.
+            [self sendEvent:@{@"event":   @"raw",
+                              @"sdk":     @"pc60fw",
+                              @"mac":     mac,
+                              @"header":  @(header),
+                              @"cmdType": @(func),
                               @"data":    [payload base64EncodedStringWithOptions:0]}];
             break;
         }

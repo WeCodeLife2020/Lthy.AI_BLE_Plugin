@@ -148,30 +148,50 @@ static const NSInteger kModelF4Scale   = 47;   // MODEL_F4_SCALE (iComon path)
     }
 
     // ── Finger Oximeter — PF-10 family ──────────────────────────────────
-    // Order matters: check longer/more-specific suffixes first so that e.g.
-    // "PF-10AW1" doesn't get eaten by the bare "pf-10aw" rule.
+    // The PF-10 lineup splits across TWO incompatible GATT profiles:
+    //
+    //   • PC60FW family   — PF-10AW / PF-10AW1 / PF-10BW / PF-10BW1
+    //     (Lepu ids 85/86/87/88). Older 0xA5-incompatible profile that
+    //     advertises the Nordic UART service (6E400001) with a custom
+    //     0xAA55-sync + CRC8/MAXIM framing. NOT supported by VTMProductLib
+    //     (no `VTMDeviceTypePC60Fw` exists) — must be driven directly via
+    //     CoreBluetooth, mirroring the Lepu Android SDK's PC60Fw path.
+    //
+    //   • FOxi family     — PF-10AW_1 (underscore-one, id 123) and
+    //     PF-10BWS (id 126). Newer URAT/0xA5-framed profile that the
+    //     VTMProductLib SDK natively understands via `VTMDeviceTypeFOxi`
+    //     and `VTMURATUtils foxi_*` helpers.
+    //
+    // Order matters: check longer/more-specific suffixes first so that
+    // e.g. "PF-10AW1" (PC60Fw, id 86) doesn't get eaten by the bare
+    // "pf-10aw" rule (PC60Fw, id 85). "PF-10AW_1" (FOxi, id 123) MUST be
+    // checked before "PF-10AW1" because lowercase normalisation does NOT
+    // remove the underscore but `hasPrefix:` will happily match the
+    // prefix without it.
     if ([n hasPrefix:@"pf-10bws"] || [n hasPrefix:@"pf10bws"]) {
         return [self buildUrat:VTMDeviceTypeFOxi model:kModelPF10BWS family:@"foxi" type:@"oximeter"];
     }
     if ([n hasPrefix:@"pf-10bw1"] || [n hasPrefix:@"pf10bw1"]) {
-        return [self buildUrat:VTMDeviceTypeFOxi model:kModelPF10BW1 family:@"foxi" type:@"oximeter"];
+        return [self buildPC60Fw:kModelPF10BW1 family:@"pc60fw"];
     }
     if ([n hasPrefix:@"pf-10bw"] || [n hasPrefix:@"pf10bw"]) {
-        return [self buildUrat:VTMDeviceTypeFOxi model:kModelPF10BW family:@"foxi" type:@"oximeter"];
+        return [self buildPC60Fw:kModelPF10BW family:@"pc60fw"];
     }
     if ([n hasPrefix:@"pf-10aw_1"] || [n hasPrefix:@"pf10aw_1"]) {
         return [self buildUrat:VTMDeviceTypeFOxi model:kModelPF10AW_1 family:@"foxi" type:@"oximeter"];
     }
     if ([n hasPrefix:@"pf-10aw1"] || [n hasPrefix:@"pf10aw1"]) {
-        return [self buildUrat:VTMDeviceTypeFOxi model:kModelPF10AW1 family:@"foxi" type:@"oximeter"];
+        return [self buildPC60Fw:kModelPF10AW1 family:@"pc60fw"];
     }
     if ([n hasPrefix:@"pf-10aw"] || [n hasPrefix:@"pf10aw"]) {
-        return [self buildUrat:VTMDeviceTypeFOxi model:kModelPF10AW family:@"foxi" type:@"oximeter"];
+        return [self buildPC60Fw:kModelPF10AW family:@"pc60fw"];
     }
-    // Legacy / generic fallback — map bare "PF-10" to the newest/shared id so
-    // Dart code that asks for "just the PF-10" still gets something sensible.
+    // Legacy / generic fallback — bare "PF-10" with no AW/BW suffix is
+    // almost always the older PC60Fw-protocol device (the newer PF-10BWS
+    // never appears without its "BWS" suffix). Route to PC60Fw with the
+    // PF-10AW model id so the Dart layer sees a sensible default.
     if ([n hasPrefix:@"pf-10"] || [n hasPrefix:@"pf10"]) {
-        return [self buildUrat:VTMDeviceTypeFOxi model:kModelPF10BWS family:@"foxi" type:@"oximeter"];
+        return [self buildPC60Fw:kModelPF10AW family:@"pc60fw"];
     }
 
     // ── Baby patch — BBSM P1 ────────────────────────────────────────────
@@ -251,9 +271,13 @@ static const NSInteger kModelF4Scale   = 47;   // MODEL_F4_SCALE (iComon path)
             return [self buildUrat:VTMDeviceTypeBP model:model family:@"bp3" type:@"bp"];
         case kModelO2RingS:
             return [self buildUrat:VTMDeviceTypeWOxi model:model family:@"woxi" type:@"oximeter"];
-        case kModelPF10AW: case kModelPF10AW1: case kModelPF10AW_1:
-        case kModelPF10BW: case kModelPF10BW1: case kModelPF10BWS:
+        case kModelPF10AW_1: case kModelPF10BWS:
+            // Newer FOxi family — handled by VTMURATUtils foxi_* helpers.
             return [self buildUrat:VTMDeviceTypeFOxi model:model family:@"foxi" type:@"oximeter"];
+        case kModelPF10AW: case kModelPF10AW1:
+        case kModelPF10BW: case kModelPF10BW1:
+            // Older PC60Fw family — direct CoreBluetooth via Nordic UART.
+            return [self buildPC60Fw:model family:@"pc60fw"];
         case kModelS1Scale:
             return [self buildUrat:VTMDeviceTypeScale model:model family:@"scale" type:@"scale"];
         case kModelBBSMBS1:
@@ -309,6 +333,16 @@ static const NSInteger kModelF4Scale   = 47;   // MODEL_F4_SCALE (iComon path)
     m.protocolPath  = VTMProtocolPathAirBP;
     m.family        = @"airbp";
     m.deviceType    = @"bp";
+    return m;
+}
+
++ (VTMDeviceMapping *)buildPC60Fw:(NSInteger)model family:(NSString *)family {
+    VTMDeviceMapping *m = [VTMDeviceMapping new];
+    m.vtmDeviceType = VTMDeviceTypeUnknown;  // not represented in VTMProductLib
+    m.lepuModel     = model;
+    m.protocolPath  = VTMProtocolPathPC60Fw;
+    m.family        = family;
+    m.deviceType    = @"oximeter";
     return m;
 }
 

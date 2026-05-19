@@ -30,6 +30,17 @@ typedef NS_ENUM(NSInteger, VTMProtocolPath) {
     /// protocol NOT covered by VTProductLib. We talk to the peripheral
     /// directly over Nordic UART (service 6E400001) using `VTAirBPPacket`.
     VTMProtocolPathAirBP,
+    /// Viatom / Wellue PC-60FW family fingertip oximeters — PF-10AW /
+    /// PF-10AW1 / PF-10BW / PF-10BW1 (Lepu MODEL_PF_10AW … MODEL_PF_10BW1,
+    /// ids 85–88). These are the *older* generation finger-clip oximeters
+    /// and use the Nordic UART service (6E400001) with a custom 0xAA55-sync
+    /// + CRC8/MAXIM framing — completely different from the FOxi (PF-10BWS)
+    /// GATT profile that VTMURATUtils expects on `VTMDeviceTypeFOxi`. The
+    /// device pushes real-time SpO2/PR/PI samples automatically once the TX
+    /// notify characteristic is subscribed; no start-streaming opcode is
+    /// required (mirroring the Lepu Android SDK's `BleServiceHelper`
+    /// auto-stream behaviour for the PC60Fw family).
+    VTMProtocolPathPC60Fw,
 };
 
 @interface VTMDeviceMapping : NSObject
