@@ -25,15 +25,27 @@ for ECG, Oximeter, Blood Pressure and Scale products.
   s.libraries = 'c++', 'stdc++'
   s.frameworks  = 'CoreBluetooth'
 
-  # Default build pulls in ECG/BP/Oximeter/AirBP support only — the iComon
-  # scale SDK is opt-in (see `IComon` subspec below) because its vendored
-  # xcframeworks register Objective-C classes whose names collide with
-  # Apple's ImageCaptureCore (`ICDevice`, `ICDeviceManager`) and
-  # iTunesCloud (`ICDeviceInfo`) private framework. Keeping the default
-  # build free of those xcframeworks eliminates the
+  # Default build pulls in ECG/BP/Oximeter/AirBP **and** the iComon
+  # body-composition scale path. Flutter's `flutter_install_all_ios_pods`
+  # only honours a plugin's default subspecs, so anything kept out of the
+  # default list silently disables itself in host apps that use the
+  # auto-Podfile flow (`FBD_HAS_ICOMON` falls to 0 and the iOS scale
+  # falls back to the generic Lescale parser, losing BIA + HR + impedance).
+  #
+  # The vendored iComon xcframeworks register Objective-C classes whose
+  # names collide with Apple's ImageCaptureCore (`ICDevice`,
+  # `ICDeviceManager`) and iTunesCloud (`ICDeviceInfo`) private
+  # frameworks, so consumers will see a one-time
   #   "objc[...]: Class ICDevice is implemented in both ..."
-  # runtime warning for apps that don't need body-composition scales.
-  s.default_subspecs = 'Core'
+  # runtime warning. That's harmless (it's a warning, not a crash) and
+  # the trade-off is worth it because every supported scale needs
+  # iComon to deliver body-composition data.
+  #
+  # Apps that genuinely don't want the iComon SDK linked in can opt out
+  # via their Podfile:
+  #
+  #   pod 'flutter_ble_devices', :path => '...', :subspecs => ['Core']
+  s.default_subspecs = ['Core', 'IComon']
 
   # ── Core subspec ─────────────────────────────────────────────────────
   # VTMProductLib 1.5 ships a real `ios-arm64_x86_64-simulator` slice, so
