@@ -2607,6 +2607,24 @@ commandCompletion:(u_char)cmdType
 
 - (void)onScanResult:(ICScanDeviceInfo *)deviceInfo {
     if (deviceInfo == nil || deviceInfo.macAddr.length == 0) return;
+
+    // The iComon SDK's CBCentralManager forwards every nearby BLE
+    // peripheral it sees, regardless of whether it speaks the iComon
+    // protocol. On iOS that surfaces Lepu ECGs (ER1/ER2), heart-rate
+    // straps, etc. as ghost "scale" entries because we previously
+    // forwarded all results with deviceType="scale". Drop anything
+    // whose ICDeviceType is not a scale variant so the host app only
+    // sees real iComon scales in the pair list.
+    BOOL isScale = (deviceInfo.type == ICDeviceTypeWeightScale ||
+                    deviceInfo.type == ICDeviceTypeFatScale ||
+                    deviceInfo.type == ICDeviceTypeFatScaleWithTemperature ||
+                    deviceInfo.type == ICDeviceTypeBalance);
+    if (!isScale) {
+        FBD_LOG(@"iComon scan dropped non-scale device name=%@ type=%lu",
+                deviceInfo.name ?: @"?", (unsigned long)deviceInfo.type);
+        return;
+    }
+
     self.iComonScans[deviceInfo.macAddr] = deviceInfo;
     [self sendEvent:@{@"event":      @"deviceFound",
                       @"name":       deviceInfo.name ?: @"",
