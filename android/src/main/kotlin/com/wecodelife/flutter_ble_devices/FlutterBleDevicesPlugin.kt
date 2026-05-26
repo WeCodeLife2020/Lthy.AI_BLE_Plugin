@@ -782,7 +782,7 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
 
         val info = ICUserInfo()
         info.userIndex   = (m["userIndex"] as? Number)?.toInt() ?: 1
-        info.userId      = (m["userId"] as? Number)?.toInt() ?: 0
+        info.userId      = (m["userId"] as? Number)?.toLong() ?: 0L
         (m["nickName"] as? String)?.let { info.nickName = it }
         info.height      = (m["heightCm"] as? Number)?.toInt() ?: 170
         info.age         = (m["age"] as? Number)?.toInt() ?: 25
@@ -791,7 +791,7 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             (m["sex"] as? Number)?.toInt() ?: 1,
             ICConstant.ICSexType.ICSexTypeMale,
         )
-        info.weight      = ((m["lastWeightKg"] as? Number)?.toFloat()) ?: 60.0f
+        info.weight      = (m["lastWeightKg"] as? Number)?.toDouble() ?: 60.0
         info.peopleType  = safe(
             ICConstant.ICPeopleType.values(),
             (m["peopleType"] as? Number)?.toInt() ?: 0,
@@ -1249,7 +1249,7 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         try {
             when (configFamilyForModel(model)) {
                 ConfigFamily.OXYII -> BleServiceHelper.BleServiceHelper.oxyIIGetBattery(model)
-                ConfigFamily.BP3   -> BleServiceHelper.BleServiceHelper.bp3GetBattery(model)
+                ConfigFamily.BP3   -> BleServiceHelper.BleServiceHelper.bp3GetInfo(model)
                 ConfigFamily.AIRBP -> BleServiceHelper.BleServiceHelper.airBpGetBattery(model)
                 ConfigFamily.NONE,
                 ConfigFamily.BP2,
@@ -1433,14 +1433,12 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     }
 
     private fun setPf10Aw1Config(model: Int, fields: Map<String, Any?>, result: Result) {
-        val cfg = com.lepu.blepro.ext.pf10aw1.Config()
-        (fields["spo2Low"] as? Int)?.let { cfg.spo2Low = it }
-        (fields["prHi"] as? Int ?: fields["prHigh"] as? Int)?.let { cfg.prHi = it }
-        (fields["prLow"] as? Int)?.let { cfg.prLow = it }
-        (fields["alarmOn"] as? Boolean ?: fields["alarm"] as? Boolean)?.let { cfg.isAlarmOn = it }
-        (fields["beepOn"] as? Boolean ?: fields["beep"] as? Boolean)?.let { cfg.isBeepOn = it }
-        (fields["esMode"] as? Int)?.let { cfg.esMode = it }
-        BleServiceHelper.BleServiceHelper.pf10Aw1SetConfig(model, cfg)
+        (fields["spo2Low"] as? Int)?.let { BleServiceHelper.BleServiceHelper.pf10Aw1SetSpo2Low(model, it) }
+        (fields["prHi"] as? Int ?: fields["prHigh"] as? Int)?.let { BleServiceHelper.BleServiceHelper.pf10Aw1SetPrHigh(model, it) }
+        (fields["prLow"] as? Int)?.let { BleServiceHelper.BleServiceHelper.pf10Aw1SetPrLow(model, it) }
+        (fields["alarmOn"] as? Boolean ?: fields["alarm"] as? Boolean)?.let { BleServiceHelper.BleServiceHelper.pf10Aw1SetAlarmSwitch(model, it) }
+        (fields["beepOn"] as? Boolean ?: fields["beep"] as? Boolean)?.let { BleServiceHelper.BleServiceHelper.pf10Aw1SetBeepSwitch(model, it) }
+        (fields["esMode"] as? Int)?.let { BleServiceHelper.BleServiceHelper.pf10Aw1SetEsMode(model, it) }
         result.success(true)
     }
 
