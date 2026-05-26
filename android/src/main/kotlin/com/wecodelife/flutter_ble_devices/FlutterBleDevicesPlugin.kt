@@ -3,6 +3,8 @@ package com.wecodelife.flutter_ble_devices
 import android.Manifest
 import android.app.Activity
 import android.app.Application
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
@@ -377,6 +379,76 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 "battery"       to data.battery,
             ))
         }
+
+        // Unit-changed reflections — fired when the user pressed the
+        // unit button on the device, or when our setX wrapper took
+        // effect. Mirrors the iOS scaleUnitChanged emitter.
+        override fun onReceiveWeightUnitChanged(
+            device: ICDevice?,
+            unit: ICConstant.ICWeightUnit?,
+        ) {
+            if (device == null || unit == null) return
+            sendEvent(mapOf(
+                "event"    to "scaleUnitChanged",
+                "subEvent" to "weight",
+                "mac"      to (device.macAddr ?: ""),
+                "unit"     to unit.ordinal,
+            ))
+        }
+
+        override fun onReceiveRulerUnitChanged(
+            device: ICDevice?,
+            unit: ICConstant.ICRulerUnit?,
+        ) {
+            if (device == null || unit == null) return
+            sendEvent(mapOf(
+                "event"    to "scaleUnitChanged",
+                "subEvent" to "ruler",
+                "mac"      to (device.macAddr ?: ""),
+                // re-shift to wire 1-indexed to match the Dart enum
+                "unit"     to (unit.ordinal + 1),
+            ))
+        }
+
+        override fun onReceiveKitchenScaleUnitChanged(
+            device: ICDevice?,
+            unit: ICConstant.ICKitchenScaleUnit?,
+        ) {
+            if (device == null || unit == null) return
+            sendEvent(mapOf(
+                "event"    to "scaleUnitChanged",
+                "subEvent" to "kitchen",
+                "mac"      to (device.macAddr ?: ""),
+                "unit"     to unit.ordinal,
+            ))
+        }
+
+        // Device-stored user profile push-back. Combines the device
+        // identity with the profile dictionary so a Dart consumer can
+        // call `ScaleUserProfile.fromMap(event)` directly.
+        override fun onReceiveUserInfo(device: ICDevice?, userInfo: ICUserInfo?) {
+            if (device == null || userInfo == null) return
+            val evt = mutableMapOf<String, Any?>(
+                "event"        to "scaleUserInfo",
+                "deviceFamily" to "icomon",
+                "mac"          to (device.macAddr ?: ""),
+            )
+            evt.putAll(mapFromIcUserInfo(userInfo))
+            sendEvent(evt)
+        }
+
+        override fun onReceiveUserInfoList(
+            device: ICDevice?,
+            list: List<ICUserInfo>?,
+        ) {
+            if (device == null) return
+            sendEvent(mapOf(
+                "event"        to "scaleUserList",
+                "deviceFamily" to "icomon",
+                "mac"          to (device.macAddr ?: ""),
+                "profiles"     to (list?.map { mapFromIcUserInfo(it) } ?: emptyList()),
+            ))
+        }
     }
 
     // ── All supported device models ─────────────────────────────────────
@@ -509,10 +581,16 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             "initService"       -> handleInitService(result)
             "checkPermissions"  -> handleCheckPermissions(result)
             "requestPermissions"-> handleRequestPermissions(result)
+            "getPermissionState"-> handleGetPermissionState(result)
             "scan"              -> handleStartScan(call, result)
             "stopScan"          -> handleStopScan(result)
             "connect"           -> handleConnect(call, result)
+            "connectKnown"      -> handleConnectKnown(call, result)
             "disconnect"        -> handleDisconnect(result)
+            "syncTime"          -> handleSyncTime(call, result)
+            "getBattery"        -> handleGetBattery(call, result)
+            "getDeviceConfig"   -> handleGetDeviceConfig(call, result)
+            "setDeviceConfig"   -> handleSetDeviceConfig(call, result)
             "startMeasurement"  -> handleStartMeasurement(call, result)
             "stopMeasurement"   -> handleStopMeasurement(call, result)
             "getDeviceInfo"     -> handleGetDeviceInfo(call, result)
@@ -523,7 +601,13 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             "continueReadFile"  -> handleContinueReadFile(call, result)
             "readHistoryData"   -> handleReadHistoryData(result)
             "factoryReset"      -> handleFactoryReset(call, result)
+            "shutdown"          -> handleShutdown(call, result)
             "updateUserInfo"    -> handleUpdateUserInfo(call, result)
+            "setScaleUserProfile" -> handleSetScaleUserProfile(call, result)
+            "setScaleUserList"  -> handleSetScaleUserList(call, result)
+            "setScaleWeightUnit"-> handleSetScaleWeightUnit(call, result)
+            "setScaleRulerUnit" -> handleSetScaleRulerUnit(call, result)
+            "setKitchenScaleUnit"-> handleSetKitchenScaleUnit(call, result)
             "isServiceReady"    -> result.success(serviceInitialized)
             "getConnectedModel" -> result.success(connectedModel)
             else                -> result.notImplemented()
@@ -536,6 +620,51 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
 
     private fun handleCheckPermissions(result: Result) {
         result.success(hasBluetoothPermissions())
+    }
+
+    /// Granular companion to [handleCheckPermissions]. Returns one of:
+    ///   "granted"       — all required runtime permissions are granted
+    ///                     AND Bluetooth is currently ON.
+    ///   "denied"        — the user has revoked at least one permission
+    ///                     and `shouldShowRequestPermissionRationale`
+    ///                     returns false (permanent deny) → consumer
+    ///                     should send them to app settings.
+    ///   "poweredOff"    — permissions are fine but the Bluetooth radio
+    ///                     is OFF; consumer should prompt to enable it.
+    ///   "unsupported"   — the device has no BluetoothAdapter
+    ///                     (extremely rare; emulator-only).
+    ///   "notDetermined" — permissions not yet requested; the consumer
+    ///                     should call `requestPermissions` first.
+    private fun handleGetPermissionState(result: Result) {
+        val ctx = context
+        if (ctx == null) { result.success("notDetermined"); return }
+        val adapter = (ctx.getSystemService(Context.BLUETOOTH_SERVICE)
+            as? BluetoothManager)?.adapter
+        if (adapter == null) { result.success("unsupported"); return }
+
+        if (!hasBluetoothPermissions()) {
+            val act = activity
+            val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                Manifest.permission.BLUETOOTH_CONNECT
+            else
+                Manifest.permission.ACCESS_FINE_LOCATION
+            val rationale = act != null &&
+                ActivityCompat.shouldShowRequestPermissionRationale(act, perm)
+            // First-launch (rationale==false AND no activity context)
+            // and "don't-ask-again" both surface as rationale==false.
+            // We disambiguate by checking whether ANY of the relevant
+            // perms is in the "previously requested at least once"
+            // state via `checkSelfPermission` returning DENIED — which
+            // happens only after the user has actively dismissed.
+            val anyRequested = ContextCompat.checkSelfPermission(
+                ctx, perm
+            ) == PackageManager.PERMISSION_DENIED && act != null && !rationale
+            result.success(if (anyRequested) "denied" else "notDetermined")
+            return
+        }
+
+        if (!adapter.isEnabled) { result.success("poweredOff"); return }
+        result.success("granted")
     }
 
     private fun handleRequestPermissions(result: Result) {
@@ -640,6 +769,161 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         }
         ICDeviceManager.shared().updateUserInfo(userInfo)
         result.success(true)
+    }
+
+    // Translate the Dart wire map (mirror of `ScaleUserProfile.toMap()`)
+    // to an `ICUserInfo`. The integer enums on the wire match the
+    // raw `ordinal()` of the corresponding ICConstant enum, so we can
+    // look them up via `values()[i]` after a bounds check.
+    @Suppress("UNCHECKED_CAST")
+    private fun icUserInfoFromMap(m: Map<String, Any?>): ICUserInfo {
+        fun <T : Enum<T>> safe(arr: Array<T>, idx: Int, default: T): T =
+            if (idx in arr.indices) arr[idx] else default
+
+        val info = ICUserInfo()
+        info.userIndex   = (m["userIndex"] as? Number)?.toInt() ?: 1
+        info.userId      = (m["userId"] as? Number)?.toInt() ?: 0
+        (m["nickName"] as? String)?.let { info.nickName = it }
+        info.height      = (m["heightCm"] as? Number)?.toInt() ?: 170
+        info.age         = (m["age"] as? Number)?.toInt() ?: 25
+        info.sex         = safe(
+            ICConstant.ICSexType.values(),
+            (m["sex"] as? Number)?.toInt() ?: 1,
+            ICConstant.ICSexType.ICSexTypeMale,
+        )
+        info.weight      = ((m["lastWeightKg"] as? Number)?.toFloat()) ?: 60.0f
+        info.peopleType  = safe(
+            ICConstant.ICPeopleType.values(),
+            (m["peopleType"] as? Number)?.toInt() ?: 0,
+            ICConstant.ICPeopleType.ICPeopleTypeNormal,
+        )
+        info.weightUnit  = safe(
+            ICConstant.ICWeightUnit.values(),
+            (m["weightUnit"] as? Number)?.toInt() ?: 0,
+            ICConstant.ICWeightUnit.ICWeightUnitKg,
+        )
+        info.rulerUnit   = safe(
+            ICConstant.ICRulerUnit.values(),
+            ((m["rulerUnit"] as? Number)?.toInt() ?: 1) - 1, // wire is 1-indexed
+            ICConstant.ICRulerUnit.ICRulerUnitCM,
+        )
+        info.kitchenUnit = safe(
+            ICConstant.ICKitchenScaleUnit.values(),
+            (m["kitchenUnit"] as? Number)?.toInt() ?: 0,
+            ICConstant.ICKitchenScaleUnit.ICKitchenScaleUnitG,
+        )
+        info.enableMeasureImpendence = (m["enableImpedance"] as? Boolean) ?: true
+        info.enableMeasureHr         = (m["enableHeartRate"] as? Boolean) ?: true
+        info.enableMeasureBalance    = (m["enableBalance"] as? Boolean) ?: true
+        info.enableMeasureGravity    = (m["enableGravity"] as? Boolean) ?: true
+        return info
+    }
+
+    // Reverse mapping for events emitted back to Dart.
+    private fun mapFromIcUserInfo(u: ICUserInfo): Map<String, Any?> = mapOf(
+        "userIndex"       to u.userIndex,
+        "userId"          to u.userId,
+        "nickName"        to u.nickName,
+        "heightCm"        to u.height,
+        "age"             to u.age,
+        "sex"             to u.sex.ordinal,
+        "lastWeightKg"    to u.weight.toDouble(),
+        "peopleType"      to u.peopleType.ordinal,
+        "weightUnit"      to u.weightUnit.ordinal,
+        "rulerUnit"       to (u.rulerUnit.ordinal + 1), // re-shift to wire 1-indexed
+        "kitchenUnit"     to u.kitchenUnit.ordinal,
+        "enableImpedance" to u.enableMeasureImpendence,
+        "enableHeartRate" to u.enableMeasureHr,
+        "enableBalance"   to u.enableMeasureBalance,
+        "enableGravity"   to u.enableMeasureGravity,
+    )
+
+    private fun handleSetScaleUserProfile(call: MethodCall, result: Result) {
+        val args = call.arguments as? Map<String, Any?>
+        if (args == null) {
+            result.error("BAD_ARG", "setScaleUserProfile expects a Map payload", null)
+            return
+        }
+        val info = icUserInfoFromMap(args)
+        ICDeviceManager.shared().updateUserInfo(info)
+        result.success(true)
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun handleSetScaleUserList(call: MethodCall, result: Result) {
+        val raw = call.argument<List<Map<String, Any?>>>("profiles")
+        if (raw == null) {
+            result.error("BAD_ARG", "setScaleUserList expects {profiles: [...]} payload", null)
+            return
+        }
+        val list = raw.map { icUserInfoFromMap(it) }
+        ICDeviceManager.shared().setUserList(list)
+        val dev = activeIComonDevice
+        if (dev != null) {
+            try {
+                ICDeviceManager.shared().settingManager
+                    .setUserList(dev, list) { code ->
+                        Log.d(TAG, "iComon setUserList per-device code=$code")
+                    }
+            } catch (e: Exception) {
+                Log.w(TAG, "iComon setUserList per-device failed: ${e.message}")
+            }
+        }
+        result.success(true)
+    }
+
+    private fun handleSetScaleWeightUnit(call: MethodCall, result: Result) {
+        val dev = activeIComonDevice
+            ?: return result.error("NOT_CONNECTED", "No iComon scale connected", null)
+        val idx = call.argument<Int>("unit")
+            ?: return result.error("BAD_ARG", "setScaleWeightUnit requires {unit: int}", null)
+        val unit = ICConstant.ICWeightUnit.values().getOrNull(idx)
+            ?: ICConstant.ICWeightUnit.ICWeightUnitKg
+        try {
+            ICDeviceManager.shared().settingManager
+                .setScaleUnit(dev, unit) { code ->
+                    Log.d(TAG, "setScaleUnit code=$code")
+                }
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("SET_UNIT_FAILED", e.message, null)
+        }
+    }
+
+    private fun handleSetScaleRulerUnit(call: MethodCall, result: Result) {
+        val dev = activeIComonDevice
+            ?: return result.error("NOT_CONNECTED", "No iComon ruler connected", null)
+        val wire = call.argument<Int>("unit")
+            ?: return result.error("BAD_ARG", "setScaleRulerUnit requires {unit: int}", null)
+        val unit = ICConstant.ICRulerUnit.values().getOrNull(wire - 1) // wire is 1-indexed
+            ?: ICConstant.ICRulerUnit.ICRulerUnitCM
+        try {
+            ICDeviceManager.shared().settingManager
+                .setRulerUnit(dev, unit) { code ->
+                    Log.d(TAG, "setRulerUnit code=$code")
+                }
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("SET_UNIT_FAILED", e.message, null)
+        }
+    }
+
+    private fun handleSetKitchenScaleUnit(call: MethodCall, result: Result) {
+        val dev = activeIComonDevice
+            ?: return result.error("NOT_CONNECTED", "No iComon kitchen scale connected", null)
+        val idx = call.argument<Int>("unit")
+            ?: return result.error("BAD_ARG", "setKitchenScaleUnit requires {unit: int}", null)
+        val unit = ICConstant.ICKitchenScaleUnit.values().getOrNull(idx)
+            ?: ICConstant.ICKitchenScaleUnit.ICKitchenScaleUnitG
+        try {
+            ICDeviceManager.shared().settingManager
+                .setKitchenScaleUnit(dev, unit) { code ->
+                    Log.d(TAG, "setKitchenScaleUnit code=$code")
+                }
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("SET_UNIT_FAILED", e.message, null)
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -859,6 +1143,359 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // Direct-connect by known MAC (no fresh scan required)
+    //
+    // Symmetric with iOS's `connectKnown` — uses BluetoothAdapter.getRemoteDevice
+    // which works for any previously-bonded device the OS still remembers.
+    // If the lookup misses (fresh install, BT cache cleared, device out of
+    // range), falls through to the same quick-rescan fallback `handleConnect`
+    // already uses from its cache-empty branch.
+    // ════════════════════════════════════════════════════════════════════
+
+    private fun handleConnectKnown(call: MethodCall, result: Result) {
+        val ctx = context ?: run {
+            result.error("NO_CONTEXT", "Context is null", null)
+            return
+        }
+        val sdk = call.argument<String>("sdk") ?: "lepu"
+        if (sdk == "icomon") {
+            // iComon's addDevice already operates by MAC string with no
+            // discovery needed — same flow as the standard connect path.
+            handleConnect(call, result)
+            return
+        }
+
+        val mac = call.argument<String>("mac") ?: run {
+            result.error("INVALID_ARGS", "mac is required", null); return
+        }
+        val model = call.argument<Int>("model") ?: run {
+            result.error("INVALID_ARGS", "model is required for connectKnown(sdk:lepu)", null)
+            return
+        }
+        autoFetchOnFinish = call.argument<Boolean>("autoFetchOnFinish") ?: true
+
+        try {
+            // BluetoothAdapter.getRemoteDevice never returns null for a
+            // valid MAC string — but it throws IllegalArgumentException on
+            // a malformed one (lower-case letters, missing colons, …). We
+            // surface that as INVALID_ARGS so the consumer can fix the
+            // argument rather than blaming the SDK.
+            val adapter: BluetoothAdapter? = (ctx.getSystemService(Context.BLUETOOTH_SERVICE)
+                    as? BluetoothManager)?.adapter
+            if (adapter == null) {
+                result.error("UNSUPPORTED", "Bluetooth is not available on this device", null)
+                return
+            }
+            val remote = try {
+                adapter.getRemoteDevice(mac.uppercase())
+            } catch (e: IllegalArgumentException) {
+                result.error("INVALID_ARGS",
+                    "mac is not a valid Bluetooth address: ${e.message}", null)
+                return
+            }
+
+            BleServiceHelper.BleServiceHelper.setInterfaces(model)
+            BleServiceHelper.BleServiceHelper.connect(
+                ctx.applicationContext, model, remote
+            )
+            connectedModel = model
+            Log.d(TAG, "connectKnown direct-connect mac=$mac model=$model")
+            result.success(true)
+        } catch (e: SecurityException) {
+            result.error("SECURITY_EXCEPTION", "BLE connect denied: ${e.message}", null)
+        } catch (e: Exception) {
+            // Fall back to the rescan-and-connect path on any other error
+            // (e.g. some OEMs throw on `connect()` for an unbonded device).
+            Log.w(TAG, "connectKnown direct-connect failed (${e.message}); falling back to rescan")
+            handleConnect(call, result)
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Time sync — push phone time to the device
+    //
+    // `BleServiceHelper.syncTime(model)` always uses the system clock —
+    // the `time` argument from Dart is therefore ignored on Android.
+    // (Lepu's helper has no overload to inject an explicit timestamp.)
+    // The audit doc calls this out explicitly so the Dart docstring
+    // reflects the asymmetry.
+    // ════════════════════════════════════════════════════════════════════
+
+    private fun handleSyncTime(call: MethodCall, result: Result) {
+        val model = call.argument<Int>("model") ?: connectedModel
+        if (model < 0) { result.error("NOT_CONNECTED", "No device connected", null); return }
+        try {
+            BleServiceHelper.BleServiceHelper.syncTime(model)
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("SYNC_TIME_FAILED", e.message, null)
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Battery query — on-demand
+    //
+    // The Lepu SDK only exposes a dedicated battery-query call for the
+    // AirBP / AP20 / SP20 / LEM / OxyII / PC80B / BP3 families. For the
+    // bigger ER1/ER2/BP2/Oxy/PF10AW1 families battery ships as a side-
+    // effect of `startRtTask` — so consumers on those families should
+    // call `startMeasurement` and observe `batteryStream` for the
+    // value carried inside every rtData packet.
+    // ════════════════════════════════════════════════════════════════════
+
+    private fun handleGetBattery(call: MethodCall, result: Result) {
+        val model = call.argument<Int>("model") ?: connectedModel
+        if (model < 0) { result.error("NOT_CONNECTED", "No device connected", null); return }
+        try {
+            when (configFamilyForModel(model)) {
+                ConfigFamily.OXYII -> BleServiceHelper.BleServiceHelper.oxyIIGetBattery(model)
+                ConfigFamily.BP3   -> BleServiceHelper.BleServiceHelper.bp3GetBattery(model)
+                ConfigFamily.AIRBP -> BleServiceHelper.BleServiceHelper.airBpGetBattery(model)
+                ConfigFamily.NONE,
+                ConfigFamily.BP2,
+                ConfigFamily.ER1,
+                ConfigFamily.ER2,
+                ConfigFamily.OXY,
+                ConfigFamily.PF10AW1 -> {
+                    result.error(
+                        "UNSUPPORTED",
+                        "Model $model has no dedicated battery query on Android. " +
+                            "Start a measurement and read battery from the rtData/batteryStream events.",
+                        mapOf("model" to model),
+                    )
+                    return
+                }
+            }
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("GET_BATTERY_FAILED", e.message, null)
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Device configuration — read / write
+    //
+    // Per family the Lepu SDK uses a different struct shape, so we route
+    // by family and emit a stable `deviceConfig` event with family-
+    // specific fields. The Dart `DeviceConfigEvent.fields` map preserves
+    // these names verbatim — see lib/src/models/device_control.dart.
+    // ════════════════════════════════════════════════════════════════════
+
+    private enum class ConfigFamily { BP2, BP3, ER1, ER2, OXY, OXYII, PF10AW1, AIRBP, NONE }
+
+    private fun configFamilyForModel(model: Int): ConfigFamily = when (model) {
+        Bluetooth.MODEL_AIRBP -> ConfigFamily.AIRBP
+
+        Bluetooth.MODEL_BP2, Bluetooth.MODEL_BP2A, Bluetooth.MODEL_BP2T -> ConfigFamily.BP2
+
+        Bluetooth.MODEL_BP3A, Bluetooth.MODEL_BP3B, Bluetooth.MODEL_BP3C,
+        Bluetooth.MODEL_BP3D, Bluetooth.MODEL_BP3E, Bluetooth.MODEL_BP3F,
+        Bluetooth.MODEL_BP3G, Bluetooth.MODEL_BP3H, Bluetooth.MODEL_BP3K,
+        Bluetooth.MODEL_BP3L, Bluetooth.MODEL_BP3Z -> ConfigFamily.BP3
+
+        Bluetooth.MODEL_ER1, Bluetooth.MODEL_ER1_N, Bluetooth.MODEL_HHM1,
+        Bluetooth.MODEL_ER1S, Bluetooth.MODEL_ER1_S, Bluetooth.MODEL_ER1_H,
+        Bluetooth.MODEL_ER1_W, Bluetooth.MODEL_ER1_L -> ConfigFamily.ER1
+
+        Bluetooth.MODEL_ER2, Bluetooth.MODEL_LP_ER2, Bluetooth.MODEL_DUOEK,
+        Bluetooth.MODEL_LEPU_ER2, Bluetooth.MODEL_HHM2, Bluetooth.MODEL_HHM3,
+        Bluetooth.MODEL_ER2_S -> ConfigFamily.ER2
+
+        // Legacy O2Ring family — Lepu's SDK doesn't expose an explicit
+        // config endpoint; settings ride along inside oxyUpdateSetting
+        // which is keyed on a vendor enum. Treat as unsupported for the
+        // generic getDeviceConfig API for now.
+        Bluetooth.MODEL_O2RING, Bluetooth.MODEL_O2M, Bluetooth.MODEL_BABYO2,
+        Bluetooth.MODEL_BABYO2N, Bluetooth.MODEL_CHECKO2, Bluetooth.MODEL_SLEEPO2,
+        Bluetooth.MODEL_SNOREO2, Bluetooth.MODEL_WEARO2, Bluetooth.MODEL_SLEEPU,
+        Bluetooth.MODEL_OXYLINK, Bluetooth.MODEL_KIDSO2, Bluetooth.MODEL_OXYFIT,
+        Bluetooth.MODEL_OXYRING, Bluetooth.MODEL_BBSM_S1, Bluetooth.MODEL_BBSM_S2,
+        Bluetooth.MODEL_OXYU, Bluetooth.MODEL_AI_S100 -> ConfigFamily.OXY
+
+        // OxyII family ≡ iOS WOxi family. The Lepu SDK uses the
+        // oxyII* methods (Config class lives in `com.lepu.blepro.ext.oxy2`).
+        Bluetooth.MODEL_O2M_WPS, Bluetooth.MODEL_OXYFIT_WPS,
+        Bluetooth.MODEL_KIDSO2_WPS, Bluetooth.MODEL_BBSM_S3,
+        Bluetooth.MODEL_O2RING_RE, Bluetooth.MODEL_O2RINGF,
+        Bluetooth.MODEL_CMRING -> ConfigFamily.OXYII
+
+        Bluetooth.MODEL_PF_10AW_1, Bluetooth.MODEL_PF_10BWS,
+        Bluetooth.MODEL_SA10AW_PU, Bluetooth.MODEL_PF10BW_VE -> ConfigFamily.PF10AW1
+
+        else -> ConfigFamily.NONE
+    }
+
+    private fun handleGetDeviceConfig(call: MethodCall, result: Result) {
+        val model = call.argument<Int>("model") ?: connectedModel
+        if (model < 0) { result.error("NOT_CONNECTED", "No device connected", null); return }
+        try {
+            when (configFamilyForModel(model)) {
+                ConfigFamily.BP2     -> BleServiceHelper.BleServiceHelper.bp2GetConfig(model)
+                ConfigFamily.BP3     -> BleServiceHelper.BleServiceHelper.bp3GetConfig(model)
+                ConfigFamily.ER1     -> BleServiceHelper.BleServiceHelper.er1GetConfig(model)
+                ConfigFamily.ER2     -> BleServiceHelper.BleServiceHelper.er2GetConfig(model)
+                ConfigFamily.OXYII   -> BleServiceHelper.BleServiceHelper.oxyIIGetConfig(model)
+                ConfigFamily.PF10AW1 -> BleServiceHelper.BleServiceHelper.pf10Aw1GetConfig(model)
+                ConfigFamily.AIRBP   -> BleServiceHelper.BleServiceHelper.airBpGetConfig(model)
+                ConfigFamily.OXY,
+                ConfigFamily.NONE    -> {
+                    result.error(
+                        "UNSUPPORTED",
+                        "Model $model does not expose a generic config endpoint on Android",
+                        mapOf("model" to model),
+                    )
+                    return
+                }
+            }
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("GET_CONFIG_FAILED", e.message, null)
+        }
+    }
+
+    private fun handleSetDeviceConfig(call: MethodCall, result: Result) {
+        val model = call.argument<Int>("model") ?: connectedModel
+        if (model < 0) { result.error("NOT_CONNECTED", "No device connected", null); return }
+        val fields = call.argument<List<Map<String, Any?>>>("fields") ?: emptyList()
+        if (fields.isEmpty()) {
+            result.error("INVALID_ARGS", "fields must be a non-empty list", null)
+            return
+        }
+        // Index by name for O(1) lookup in the per-family builders below.
+        val byName: Map<String, Any?> = fields.associate { f ->
+            (f["name"] as? String ?: "") to f["value"]
+        }
+        try {
+            when (configFamilyForModel(model)) {
+                ConfigFamily.BP2     -> setBp2Config(model, byName, result)
+                ConfigFamily.BP3     -> setBp3Config(model, byName, result)
+                ConfigFamily.ER1     -> setEr1Config(model, byName, result)
+                ConfigFamily.ER2     -> setEr2Config(model, byName, result)
+                ConfigFamily.OXYII   -> setOxyIIConfig(model, byName, result)
+                ConfigFamily.PF10AW1 -> setPf10Aw1Config(model, byName, result)
+                ConfigFamily.AIRBP   -> setAirBpConfig(model, byName, result)
+                ConfigFamily.OXY,
+                ConfigFamily.NONE    -> {
+                    result.error(
+                        "UNSUPPORTED",
+                        "setDeviceConfig is not wired for model $model on Android",
+                        mapOf("model" to model),
+                    )
+                    return
+                }
+            }
+        } catch (e: Exception) {
+            result.error("SET_CONFIG_FAILED", e.message, null)
+        }
+    }
+
+    // ── Per-family setConfig builders ───────────────────────────────────
+    //
+    // Each builder constructs the vendor's Kotlin config class, populates
+    // only the fields the consumer supplied (preserving defaults for the
+    // rest), and dispatches to the matching `BleServiceHelper.xxxSetConfig`.
+    // Reflection is used for the Oxy2 nested-class fields so a missing
+    // setter (vendor SDK update) doesn't crash the whole call.
+
+    private fun setBp2Config(model: Int, fields: Map<String, Any?>, result: Result) {
+        val cfg = com.lepu.blepro.ext.bp2.Bp2Config()
+        (fields["soundOn"] as? Boolean)?.let { cfg.isSoundOn = it }
+        BleServiceHelper.BleServiceHelper.bp2SetConfig(model, cfg)
+        result.success(true)
+    }
+
+    private fun setBp3Config(model: Int, fields: Map<String, Any?>, result: Result) {
+        val cfg = com.lepu.blepro.ext.bp3.Bp3Config()
+        (fields["soundOn"] as? Boolean)?.let { cfg.isSoundOn = it }
+        (fields["avgMeasureMode"] as? Int)?.let { cfg.avgMeasureMode = it }
+        (fields["volume"] as? Int)?.let { cfg.volume = it }
+        BleServiceHelper.BleServiceHelper.bp3SetConfig(model, cfg)
+        result.success(true)
+    }
+
+    private fun setEr1Config(model: Int, fields: Map<String, Any?>, result: Result) {
+        val cfg = com.lepu.blepro.ext.er1.Er1Config()
+        (fields["vibration"] as? Boolean)?.let { cfg.isVibration = it }
+        (fields["threshold1"] as? Int)?.let { cfg.threshold1 = it }
+        (fields["threshold2"] as? Int)?.let { cfg.threshold2 = it }
+        BleServiceHelper.BleServiceHelper.er1SetConfig(model, cfg)
+        result.success(true)
+    }
+
+    private fun setEr2Config(model: Int, fields: Map<String, Any?>, result: Result) {
+        val cfg = com.lepu.blepro.ext.er2.Er2Config()
+        (fields["soundOn"] as? Boolean)?.let { cfg.isSoundOn = it }
+        (fields["vector"] as? Int)?.let { cfg.vector = it }
+        (fields["motionCount"] as? Int)?.let { cfg.motionCount = it }
+        (fields["motionWindows"] as? Int)?.let { cfg.motionWindows = it }
+        BleServiceHelper.BleServiceHelper.er2SetConfig(model, cfg)
+        result.success(true)
+    }
+
+    private fun setPf10Aw1Config(model: Int, fields: Map<String, Any?>, result: Result) {
+        val cfg = com.lepu.blepro.ext.pf10aw1.Config()
+        (fields["spo2Low"] as? Int)?.let { cfg.spo2Low = it }
+        (fields["prHi"] as? Int ?: fields["prHigh"] as? Int)?.let { cfg.prHi = it }
+        (fields["prLow"] as? Int)?.let { cfg.prLow = it }
+        (fields["alarmOn"] as? Boolean ?: fields["alarm"] as? Boolean)?.let { cfg.isAlarmOn = it }
+        (fields["beepOn"] as? Boolean ?: fields["beep"] as? Boolean)?.let { cfg.isBeepOn = it }
+        (fields["esMode"] as? Int)?.let { cfg.esMode = it }
+        BleServiceHelper.BleServiceHelper.pf10Aw1SetConfig(model, cfg)
+        result.success(true)
+    }
+
+    // AirBP / SmartBP — the SDK's `airBpSetConfig` takes a single bool
+    // (sound-on). If a consumer passes `soundOn` that wins; otherwise
+    // we look for the iOS-side `volume == 0` convention so a single
+    // mute-everywhere call works on both platforms.
+    private fun setAirBpConfig(model: Int, fields: Map<String, Any?>, result: Result) {
+        val sound = fields["soundOn"] as? Boolean
+            ?: (fields["volume"] as? Int)?.let { it > 0 }
+            ?: true
+        BleServiceHelper.BleServiceHelper.airBpSetConfig(model, sound)
+        result.success(true)
+    }
+
+    // OxyII's `oxy2.Config` exposes one nested wrapper class per setting
+    // (Spo2Switch/Spo2Low/HrSwitch/HrLow/HrHigh/Motor/Buzzer/DisplayMode/
+    // BrightnessMode/StorageInterval), each with a single `val` u_int.
+    // We allocate a wrapper for every field the consumer supplied so the
+    // SDK ships a partial-update packet. Reflection keeps us tolerant of
+    // SDK upgrades that rename a nested class.
+    private fun setOxyIIConfig(model: Int, fields: Map<String, Any?>, result: Result) {
+        val cfg = com.lepu.blepro.ext.oxy2.Config()
+        fun assignNested(setterName: String, nestedClassSimpleName: String, value: Int) {
+            try {
+                val nested = Class.forName(
+                    "com.lepu.blepro.ext.oxy2.Config\$$nestedClassSimpleName"
+                )
+                val wrapper = nested.getDeclaredConstructor().newInstance()
+                // Each nested type has a single `setVal(int)` setter
+                // (per the AAR's javap dump). Call it reflectively to
+                // shield against a future field rename.
+                val setVal = nested.getMethod("setVal", Int::class.javaPrimitiveType)
+                setVal.invoke(wrapper, value)
+                val setter = cfg.javaClass.getMethod(setterName, nested)
+                setter.invoke(cfg, wrapper)
+            } catch (e: Throwable) {
+                Log.w(TAG, "setOxyIIConfig: skipping '$setterName' — ${e.message}")
+            }
+        }
+        (fields["spo2RemindSw"] as? Int)?.let { assignNested("setSpo2Switch", "Spo2Switch", it) }
+        (fields["spo2Thr"]     as? Int)?.let { assignNested("setSpo2Low",    "Spo2Low",    it) }
+        (fields["hrRemindSw"]  as? Int)?.let { assignNested("setHrSwitch",   "HrSwitch",   it) }
+        (fields["hrThrLow"]    as? Int)?.let { assignNested("setHrLow",      "HrLow",      it) }
+        (fields["hrThrHigh"]   as? Int)?.let { assignNested("setHrHi",       "HrHigh",     it) }
+        (fields["motor"]       as? Int)?.let { assignNested("setMotor",      "Motor",      it) }
+        (fields["buzzer"]      as? Int)?.let { assignNested("setBuzzer",     "Buzzer",     it) }
+        (fields["displayMode"] as? Int)?.let { assignNested("setDisplayMode","DisplayMode",it) }
+        (fields["brightness"]  as? Int)?.let { assignNested("setBrightnessMode","BrightnessMode",it) }
+        (fields["interval"]    as? Int)?.let { assignNested("setStorageInterval","StorageInterval", it) }
+        BleServiceHelper.BleServiceHelper.oxyIISetConfig(model, cfg)
+        result.success(true)
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // Real-time measurement
     // ════════════════════════════════════════════════════════════════════
 
@@ -869,7 +1506,16 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             return
         }
         try {
-            BleServiceHelper.BleServiceHelper.startRtTask(model)
+            // AirBP / SmartBP doesn't use the generic startRtTask hook;
+            // the Lepu SDK exposes a dedicated `airBpStartBpTest` that
+            // posts EventAirBpRtData / EventAirBpRtState / EventAirBpRtResult
+            // back through LiveEventBus. Same wire format as iOS's
+            // VTAirBPCmdStartMeasure handler.
+            if (model == Bluetooth.MODEL_AIRBP) {
+                BleServiceHelper.BleServiceHelper.airBpStartBpTest(model)
+            } else {
+                BleServiceHelper.BleServiceHelper.startRtTask(model)
+            }
             result.success(true)
         } catch (e: Exception) {
             result.error("START_RT_FAILED", e.message, null)
@@ -921,6 +1567,8 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 Bluetooth.MODEL_PF_10AW_1, Bluetooth.MODEL_PF_10BWS,
                 Bluetooth.MODEL_SA10AW_PU, Bluetooth.MODEL_PF10BW_VE ->
                     BleServiceHelper.BleServiceHelper.pf10Aw1GetInfo(model)
+                Bluetooth.MODEL_AIRBP ->
+                    BleServiceHelper.BleServiceHelper.airBpGetInfo(model)
                 else -> {}
             }
             result.success(true)
@@ -1295,6 +1943,26 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         }
     }
 
+    // Politely power off the device. The Lepu SDK does NOT expose a
+    // dedicated shutdown opcode for any family — every method in
+    // `BleServiceHelper` is for read/write/measurement only, and there
+    // is no `xxxShutdown`/`xxxPowerOff`. The closest match is BP2's
+    // `bp2SwitchState(model, 4)` (state 4 = shutdown in the BP2
+    // firmware enum), but the public Kotlin API doesn't expose it.
+    //
+    // Until upstream surfaces a shutdown API we return UNSUPPORTED so
+    // consumers can fall back to `disconnect()`. On iOS the BP2 path
+    // works via VTMBPTargetStatusEnd; this asymmetry is documented in
+    // the README.
+    private fun handleShutdown(call: MethodCall, result: Result) {
+        val model = call.argument<Int>("model") ?: connectedModel
+        result.error(
+            "UNSUPPORTED",
+            "shutdown is not exposed by lepu-blepro for any family on Android; disconnect instead.",
+            mapOf("model" to model),
+        )
+    }
+
     private fun handleFactoryReset(call: MethodCall, result: Result) {
         val model = call.argument<Int>("model") ?: connectedModel
         if (model < 0) { result.error("NOT_CONNECTED", "No device connected", null); return }
@@ -1320,6 +1988,8 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 Bluetooth.MODEL_PF_10AW_1, Bluetooth.MODEL_PF_10BWS,
                 Bluetooth.MODEL_SA10AW_PU, Bluetooth.MODEL_PF10BW_VE ->
                     BleServiceHelper.BleServiceHelper.pf10Aw1FactoryReset(model)
+                Bluetooth.MODEL_AIRBP ->
+                    BleServiceHelper.BleServiceHelper.airBpFactoryReset(model)
                 else -> {}
             }
             result.success(true)
@@ -1778,6 +2448,17 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 ))
             }
 
+        // ════════════════════════════════════════════════════════════
+        // Device-config + battery observers — wire format mirrors iOS.
+        // Each handler reflects the SDK's family-specific struct into a
+        // flat `deviceConfig` event so Dart sees a stable shape across
+        // platforms. See lib/src/models/device_control.dart for the
+        // typed view (DeviceConfigEvent / BatteryInfo).
+        // ════════════════════════════════════════════════════════════
+        registerConfigObservers()
+        registerBatteryObservers()
+        registerAirBpObservers()
+
         // Encrypt verification (PC60FW family)
         LiveEventBus.get<InterfaceEvent>(EventMsgConst.Ble.EventBleDeviceEncryptVerificationCompleted)
             .observeForever { event ->
@@ -2012,5 +2693,311 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             .observeForever { e -> emitReadComplete("pf10aw1", e.model, e.data) }
         LiveEventBus.get<InterfaceEvent>(InterfaceEvent.Pf10Aw1.EventPf10Aw1ReadFileError)
             .observeForever { e -> emitReadError("pf10aw1", e.model, e.data) }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Device-config observers
+    //
+    // The Lepu SDK posts vendor-specific config structs through these
+    // events; we reflect them into a flat map so Dart sees the same
+    // `deviceConfig` wire format the iOS plugin emits.
+    //
+    // Notes on field naming:
+    //   - We keep getter-derived names verbatim (e.g. `isSoundOn` →
+    //     `soundOn`) so a one-to-one mapping with `ConfigField.name`
+    //     round-trips losslessly through getDeviceConfig + setDeviceConfig.
+    //   - OxyII / oxy2 publishes nested wrapper classes per setting;
+    //     extractConfigFields drills into each via reflection.
+    // ════════════════════════════════════════════════════════════════════
+
+    private fun registerConfigObservers() {
+        // BP2 family
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.BP2.EventBp2GetConfig)
+            .observeForever { e -> emitDeviceConfig("bp2", e.model, e.data) }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.BP2.EventBp2SetConfig)
+            .observeForever { e ->
+                // Re-emit the cached fields so consumers waiting on
+                // deviceConfigStream see a write-acknowledged event too.
+                emitDeviceConfig("bp2", e.model, e.data, ack = true)
+            }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.BP2.EventBp2GetConfigError)
+            .observeForever { e -> emitDeviceConfigError("bp2", e.model, e.data) }
+
+        // BP3 family — same channel naming, different class (Bp3Config).
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.BP3.EventBp3GetConfig)
+            .observeForever { e -> emitDeviceConfig("bp3", e.model, e.data) }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.BP3.EventBp3SetConfig)
+            .observeForever { e -> emitDeviceConfig("bp3", e.model, e.data, ack = true) }
+
+        // ER1 family
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.ER1.EventEr1GetConfig)
+            .observeForever { e -> emitDeviceConfig("er1", e.model, e.data) }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.ER1.EventEr1SetConfig)
+            .observeForever { e -> emitDeviceConfig("er1", e.model, e.data, ack = true) }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.ER1.EventEr1GetConfigError)
+            .observeForever { e -> emitDeviceConfigError("er1", e.model, e.data) }
+
+        // ER2 family
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.ER2.EventEr2GetConfig)
+            .observeForever { e -> emitDeviceConfig("er2", e.model, e.data) }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.ER2.EventEr2SetConfig)
+            .observeForever { e -> emitDeviceConfig("er2", e.model, e.data, ack = true) }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.ER2.EventEr2GetConfigError)
+            .observeForever { e -> emitDeviceConfigError("er2", e.model, e.data) }
+
+        // OxyII family — uses the `oxy2.Config` shape with nested wrappers.
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.OxyII.EventOxyIIGetConfig)
+            .observeForever { e -> emitDeviceConfig("oxyII", e.model, e.data) }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.OxyII.EventOxyIISetConfig)
+            .observeForever { e -> emitDeviceConfig("oxyII", e.model, e.data, ack = true) }
+
+        // PF10AW1 family
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.Pf10Aw1.EventPf10Aw1GetConfig)
+            .observeForever { e -> emitDeviceConfig("pf10aw1", e.model, e.data) }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.Pf10Aw1.EventPf10Aw1SetConfig)
+            .observeForever { e -> emitDeviceConfig("pf10aw1", e.model, e.data, ack = true) }
+    }
+
+    private fun registerBatteryObservers() {
+        // The Lepu SDK only exposes EventXxxGetBattery for the small
+        // subset of families whose protocol has an on-demand battery
+        // query (OxyII / BP3 / AirBP / AP20 / SP20 / LEM / PC80B).
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.OxyII.EventOxyIIGetBattery)
+            .observeForever { e -> emitBatteryEvent("oxyII", e.model, e.data) }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.BP3.EventBp3GetBattery)
+            .observeForever { e -> emitBatteryEvent("bp3", e.model, e.data) }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.AirBP.EventAirBpGetBattery)
+            .observeForever { e -> emitBatteryEvent("airbp", e.model, e.data) }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // AirBP / SmartBP observers
+    //
+    // Wire format mirrors the iOS plugin's `handleAirBPFrameCmd:`
+    // implementation so a Dart consumer can subscribe to the same
+    // `rtData` shape on either platform:
+    //
+    //   - rt.data    → `rtData` { measureType: "bp_measuring", pressure, pulseWave }
+    //   - rt.state   → `rtData` { measureType: "bp_status", status }
+    //   - rt.result  → `rtData` { measureType: "bp_result", sys, dia, mean, pr,
+    //                              state, timestamp }
+    //   - get.info   → `deviceInfo`
+    //   - get.config → `deviceConfig` (family="airbp")
+    //   - set.config → `deviceConfig` (family="airbp", ack=true)
+    //   - reset      → `connectionState` subEvent="reset"
+    //   - factoryReset → `connectionState` subEvent="factoryReset"
+    //
+    // The SDK posts a Bluetooth-specific payload type per channel; we
+    // reflect rather than cast so an SDK version bump that reshapes the
+    // struct doesn't break the bridge.
+    // ════════════════════════════════════════════════════════════════════
+
+    private fun registerAirBpObservers() {
+        val mainFam = "airbp"
+
+        // rt.data — pressure / pulse pair posted while the cuff inflates.
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.AirBP.EventAirBpRtData)
+            .observeForever { e ->
+                val pressure = reflectInt(e.data, "getPressure")
+                    ?: reflectInt(e.data, "getStaticPressure")
+                val pulseWave = reflectInt(e.data, "getPulse")
+                    ?: reflectInt(e.data, "getPulseWave")
+                sendEvent(mapOf(
+                    "event"        to "rtData",
+                    "deviceType"   to "bp",
+                    "deviceFamily" to mainFam,
+                    "sdk"          to "lepu",
+                    "model"        to e.model,
+                    "measureType"  to "bp_measuring",
+                    "pressure"     to (pressure?.let { it / 100.0 }),
+                    "pressureRaw"  to pressure,
+                    "pulseWave"    to pulseWave,
+                    "pulseWaveRaw" to pulseWave,
+                ))
+            }
+
+        // rt.state — running-status enum (idle / inflating / deflating / done).
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.AirBP.EventAirBpRtState)
+            .observeForever { e ->
+                val status = when (val d = e.data) {
+                    is Int -> d
+                    is Number -> d.toInt()
+                    else -> reflectInt(d, "getState") ?: reflectInt(d, "getStatus")
+                }
+                sendEvent(mapOf(
+                    "event"        to "rtData",
+                    "deviceType"   to "bp",
+                    "deviceFamily" to mainFam,
+                    "sdk"          to "lepu",
+                    "model"        to e.model,
+                    "measureType"  to "bp_status",
+                    "status"       to status,
+                ))
+            }
+
+        // rt.result — final SBP/DBP/MAP/PR. Lepu uses `RtResult`; struct
+        // mirrors iOS payload bytes 8..15.
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.AirBP.EventAirBpRtResult)
+            .observeForever { e ->
+                val r = e.data ?: return@observeForever
+                val y = reflectInt(r, "getYear") ?: 0
+                val mo = reflectInt(r, "getMonth") ?: 0
+                val d = reflectInt(r, "getDay") ?: 0
+                val h = reflectInt(r, "getHour") ?: 0
+                val mi = reflectInt(r, "getMinute") ?: 0
+                val s = reflectInt(r, "getSecond") ?: 0
+                val ts = "%04d-%02d-%02d %02d:%02d:%02d".format(y, mo, d, h, mi, s)
+                sendEvent(mapOf(
+                    "event"        to "rtData",
+                    "deviceType"   to "bp",
+                    "deviceFamily" to mainFam,
+                    "sdk"          to "lepu",
+                    "model"        to e.model,
+                    "measureType"  to "bp_result",
+                    "sys"          to reflectInt(r, "getSys"),
+                    "dia"          to reflectInt(r, "getDia"),
+                    "mean"         to reflectInt(r, "getMean"),
+                    "pr"           to reflectInt(r, "getPr"),
+                    "state"        to reflectInt(r, "getStateCode"),
+                    "timestamp"    to ts,
+                ))
+            }
+
+        // get.info — emit a `deviceInfo` event with the reflected struct.
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.AirBP.EventAirBpGetInfo)
+            .observeForever { e ->
+                val payload = mutableMapOf<String, Any?>(
+                    "event" to "deviceInfo",
+                    "sdk"   to "lepu",
+                    "model" to e.model,
+                )
+                e.data?.let { payload.putAll(extractConfigFields(it)) }
+                sendEvent(payload)
+            }
+
+        // get.config / set.config — flat `deviceConfig` events (family=airbp).
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.AirBP.EventAirBpGetConfig)
+            .observeForever { e -> emitDeviceConfig(mainFam, e.model, e.data) }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.AirBP.EventAirBpSetConfig)
+            .observeForever { e -> emitDeviceConfig(mainFam, e.model, e.data, ack = true) }
+
+        // reset / factory reset — surface as connection sub-events for
+        // parity with the existing UI hooks.
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.AirBP.EventAirBpReset)
+            .observeForever { e ->
+                sendEvent(mapOf(
+                    "event" to "connectionState", "state" to "connected",
+                    "model" to e.model, "subEvent" to "reset",
+                ))
+            }
+        LiveEventBus.get<InterfaceEvent>(InterfaceEvent.AirBP.EventAirBpFactoryReset)
+            .observeForever { e ->
+                sendEvent(mapOf(
+                    "event" to "connectionState", "state" to "connected",
+                    "model" to e.model, "subEvent" to "factoryReset",
+                ))
+            }
+    }
+
+    /// Reflect every getter on the SDK's config object into a flat map.
+    /// Boolean getters are normalised from `isFoo()` → `foo` so the
+    /// field name matches `ConfigField.name`.
+    ///
+    /// `ack` distinguishes a "read response" from a "write
+    /// acknowledged" emission. Dart consumers can ignore the flag for
+    /// the simple read flow.
+    private fun emitDeviceConfig(family: String, model: Int, data: Any?,
+                                 ack: Boolean = false) {
+        if (data == null) return
+        val fields = extractConfigFields(data)
+        val payload = mutableMapOf<String, Any?>(
+            "event"  to "deviceConfig",
+            "family" to family,
+            "model"  to model,
+        )
+        if (ack) payload["ack"] = true
+        payload.putAll(fields)
+        sendEvent(payload)
+    }
+
+    private fun emitDeviceConfigError(family: String, model: Int, data: Any?) {
+        sendEvent(mapOf(
+            "event"  to "deviceConfigError",
+            "family" to family,
+            "model"  to model,
+            "error"  to (data?.toString() ?: "unknown"),
+        ))
+    }
+
+    /// Reflect every `getXxx()` / `isXxx()` getter on the supplied
+    /// config object into a Map keyed by the bean-property name.
+    /// Nested oxy2.Config wrappers (Spo2Switch/HrLow/…) are unwrapped
+    /// to their inner `val` so the map stays flat.
+    private fun extractConfigFields(obj: Any): Map<String, Any?> {
+        val out = mutableMapOf<String, Any?>()
+        for (m in obj.javaClass.methods) {
+            if (m.parameterCount != 0) continue
+            val name = m.name
+            val isGetter = name.length > 3 && name.startsWith("get") &&
+                Character.isUpperCase(name[3])
+            val isIs = name.length > 2 && name.startsWith("is") &&
+                Character.isUpperCase(name[2])
+            if (!isGetter && !isIs) continue
+            // Skip Object-defined accessors that ride along on every class.
+            if (name == "getClass") continue
+            val key = if (isGetter) {
+                name.substring(3).replaceFirstChar { it.lowercase() }
+            } else {
+                // `isFoo` → `foo` so it matches the consumer's field name.
+                name.substring(2).replaceFirstChar { it.lowercase() }
+            }
+            val raw = try { m.invoke(obj) } catch (_: Throwable) { null }
+            // Unwrap oxy2.Config nested wrappers — every one of them
+            // exposes a single `getVal()` int getter that holds the
+            // setting value.
+            val flattened = if (raw != null &&
+                raw.javaClass.name.startsWith("com.lepu.blepro.ext.oxy2.Config\$")) {
+                try { raw.javaClass.getMethod("getVal").invoke(raw) } catch (_: Throwable) { raw }
+            } else raw
+            if (flattened is Int || flattened is Boolean || flattened is String ||
+                flattened is Long || flattened is Double || flattened == null) {
+                out[key] = flattened
+            } else if (flattened is Number) {
+                out[key] = flattened.toInt()
+            }
+            // Other shapes (byte[]) are skipped — the consumer doesn't
+            // get to see calibration blobs through this flat map.
+        }
+        return out
+    }
+
+    private fun emitBatteryEvent(family: String, model: Int, data: Any?) {
+        // Each family's GetBattery event posts a different concrete
+        // type, so we reflect rather than cast. Common field names:
+        //   getPercent() : Int     — both OxyII / BP3
+        //   getStatus()  : Int     — OxyII (battery state enum)
+        //   getState()   : Int     — BP3
+        //   getVoltage() : Int     — some firmwares
+        val percent = reflectInt(data, "getPercent")
+        val state = reflectInt(data, "getState") ?: reflectInt(data, "getStatus")
+        val voltage = reflectInt(data, "getVoltage")
+        sendEvent(mapOf(
+            "event"   to "battery",
+            "family"  to family,
+            "model"   to model,
+            "percent" to percent,
+            "state"   to state,
+            "voltage" to voltage,
+        ))
+    }
+
+    private fun reflectInt(obj: Any?, getter: String): Int? {
+        if (obj == null) return null
+        return try {
+            val v = obj.javaClass.getMethod(getter).invoke(obj)
+            (v as? Number)?.toInt()
+        } catch (_: Throwable) {
+            null
+        }
     }
 }

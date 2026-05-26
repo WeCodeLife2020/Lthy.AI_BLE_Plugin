@@ -46,7 +46,11 @@ streams work on both platforms.
   cross-platform [`LescaleController`](lib/src/lescale_controller.dart)
   which drives the peripheral with `flutter_blue_plus` directly and does
   not rely on the Lepu or iComon native bridges. Advertises model id
-  `DeviceModels.lescaleF4` (`9999`).
+  `DeviceModels.lescaleF4` (`9999`). Supports a multi-user picker
+  (`setProfilesFromFamilyMembers` / `LescaleUserProfile`) that mirrors
+  the family-member auto-detection in vendor apps like ViHealth — see
+  the [Multi-user family picker](#multi-user-family-picker-lescale-f4)
+  section below.
 
 ---
 
@@ -314,7 +318,9 @@ Emitted on `BluetodevController.eventStream`:
 { 'event': 'recordingFinished', 'model', 'deviceFamily' }
 { 'event': 'historyData', 'kind': 'weight'|'kitchenScale'|'ruler'|'skip',
                            'deviceFamily': 'icomon', 'mac', 'time', ...kind-specific }
-{ 'event': 'battery',   'state', 'percent', 'voltage' }
+{ 'event': 'battery',   'family', 'model', 'state'?, 'percent'?, 'batLevel'?, 'voltage'? }
+{ 'event': 'deviceConfig', 'family', 'model', 'ack'?, ...family-specific fields }
+{ 'event': 'deviceConfigError', 'family', 'model', 'error' }
 ```
 
 ### `rtData` fields per family
@@ -336,6 +342,189 @@ On iOS, unstructured device responses (unmapped cmdTypes) are emitted as:
 
 ```
 { 'event': 'raw', 'cmdType', 'deviceType', 'data': '<base64>' }
+```
+
+---
+
+## Device control (time, battery, config, auto-reconnect)
+
+ViHealth-parity APIs added in this PR. All are cross-platform.
+
+### Time sync — `syncTime`
+
+Push the phone's clock to the device so on-device recordings carry an
+accurate timestamp. Without this, BP2 / ER1 / ER2 / O2Ring records
+drift after every battery change.
+
+```dart
+await BluetodevController.syncTime(); // uses DateTime.now()
+await BluetodevController.syncTime(time: DateTime.utc(2026, 1, 1));
+```
+
+Notes:
+- **Android** — `BleServiceHelper.syncTime(model)` always uses the
+  system clock. The `time` argument is ignored on Android.
+- **iOS** — URAT family uses `[VTMURATUtils syncTime:]`; the legacy
+  O2 family writes the `VTParamTypeDate` parameter with the phone's
+  local wall-clock.
+- iComon scales / AirBP / PC60FW are silently accepted as no-ops.
+
+### Auto-reconnect by MAC — `connectKnown`
+
+Direct-connect to a previously-paired device without paying for a
+fresh scan. Use on app launch to re-attach to the last device.
+
+```dart
+final ok = await BluetodevController.connectKnown(
+  model: lastKnownModel,
+  mac: lastKnownMac,
+);
+```
+
+- **iOS** — `[CBCentralManager retrievePeripheralsWithIdentifiers:]`
+  on the persisted UUID. The `mac` argument is the
+  `CBPeripheral.identifier.UUIDString` value emitted in `deviceFound`.
+- **Android** — `BluetoothAdapter.getRemoteDevice(mac)`. Falls back
+  to a short (≤10 s) rescan if the lookup misses.
+
+### Battery query — `getBattery`
+
+```dart
+final battery = await BluetodevController.getBattery();
+print(battery?.percent); // 0..100
+```
+
+Coverage:
+- **iOS** — every URAT family + legacy O2 (universal).
+- **Android** — only OxyII / BP3 (and AirBP / AP20 / SP20 / LEM / PC80B
+  when those families are routed through the plugin). For
+  ER1 / ER2 / BP2 / Oxy / PF10AW1 the SDK only ships battery as a
+  side-effect of `startMeasurement`; listen on
+  `BluetodevController.batteryStream` (or read the `battery` field
+  inside `rtData` events) to read the value.
+
+### Device configuration — `getDeviceConfig` / `setDeviceConfig`
+
+```dart
+final cfg = await BluetodevController.getDeviceConfig(); // returns DeviceConfigEvent
+print(cfg?.volume);             // e.g. 2 for BP2
+print(cfg?.spo2Threshold);      // e.g. 88 for WOxi/FOxi
+
+// Pushing config back — write only the fields you want changed.
+await BluetodevController.setDeviceConfig([
+  const ConfigField('volume', 1),
+  const ConfigField('spo2Thr', 90), // WOxi
+]);
+```
+
+The set of populated fields is family-dependent. Family ↔ field
+reference (cross-platform unless noted):
+
+| Family | Read fields | Writable via `ConfigField.name` |
+| --- | --- | --- |
+| `bp2` (iOS only) | `calibZero`, `calibSlope`, `volume`, `avgMeasureMode`, `deviceSwitch`, `unit`, `language`, `timeUtc`, `sleepTicks`, `calibTicks`, `targetPressure` | `volume`, `avgMeasureMode`, `deviceSwitch`, `unit`, `language`, `timeUtc`, `targetPressure`, `soundOn` (bool, sets `deviceSwitch` bit0). **Requires a prior `getDeviceConfig` to seed calibration.** |
+| `bp2` (Android) | `soundOn` | `soundOn` |
+| `bp3` (Android) | `soundOn`, `volume`, `avgMeasureMode` | same |
+| `er1` (Android) | `vibration`, `threshold1`, `threshold2` | same |
+| `er2` (Android) | `soundOn`, `vector`, `motionCount`, `motionWindows` | same |
+| `woxi` (iOS) / `oxyII` (Android) | `spo2Thr`, `hrThrLow`, `hrThrHigh`, `motor`, `buzzer`, `displayMode`, `brightness`, `interval`, `spo2RemindSw`, `hrRemindSw`, … | same |
+| `foxi` (iOS) | `spo2Low`, `prHigh`, `prLow`, `alarm`, `measureMode`, `beep`, `language`, `bleSw`, `esMode` | same |
+| `pf10aw1` (Android) | `spo2Low`, `prHi`, `prLow`, `alarmOn`, `beepOn`, `esMode` | same |
+
+`DeviceConfigEvent.fields` is a `Map<String, Object?>` that carries
+every key the native side emitted, so a vendor-SDK update that adds a
+new field flows through to Dart without code changes. Use the typed
+getters (`volume`, `brightness`, `spo2Threshold`, `pulseRateLow`,
+`pulseRateHigh`) for the common cross-family values.
+
+---
+
+## Multi-user family picker (LeScale F4)
+
+The F4 firmware can only hold **one** user slot at a time, but vendor
+apps like ViHealth auto-detect *whose* measurement just landed by
+matching the locked weight against each household member's expected
+weight.  The plugin replicates that logic so you get the same behaviour
+without writing the picker yourself.
+
+### Quick setup (two lines)
+
+```dart
+import 'package:flutter_ble_devices/flutter_ble_devices.dart';
+
+// Call this whenever the family list or biometric profiles change.
+// Typically: in initState / after FamilyMemberService.refreshFromServer.
+LescaleController.setProfilesFromFamilyMembers(
+  members: FamilyMemberService.instance.members
+      .map((m) => m.toJson()).toList(),
+
+  // Optional: per-member biometric overrides (height/age/isMale/
+  // targetWeightKg). These win over whatever is in FamilyMember.
+  biometricProfiles: {
+    for (final m in FamilyMemberService.instance.members)
+      m.id: (await MemberProfileService.load(memberId: m.id))?.toJson()
+          ?? MemberBiometricProfile.defaults.toJson(),
+  },
+
+  // Active member goes to position [0] → becomes the auto-pick
+  // fallback when nobody's weight bracket matches.  Does NOT pin —
+  // a different member stepping on the scale still wins.
+  activeMemberId: FamilyMemberService.instance.activeMember?.id,
+);
+```
+
+### How auto-pick works
+
+1. When a **locked weight** (`0xA3` / `0x80` frame) arrives the
+   picker compares the reading against every profile's
+   `expectedWeightKg`.
+2. The profile whose stored weight is **closest and within
+   `LescaleController.autoPickToleranceKg`** (default **5 kg**) is
+   selected.  Tie-break: first declared profile.
+3. If no profile is within tolerance, the fallback at position `[0]`
+   is used (which is the `activeMemberId` you provided, or the first
+   declared member if you didn't supply one).
+4. Every `rtData` event carries `userId` and `userName` so the UI
+   knows whose result to display:
+
+```dart
+LescaleController.eventStream.listen((event) {
+  if (event['event'] == 'rtData' && event['isLocked'] == true) {
+    final memberId = event['userId'] as String;   // e.g. "p-123"
+    final name     = event['userName'] as String; // e.g. "Alice"
+    final pinned   = event['pinned'] as bool;     // manual override?
+    final weight   = event['weightKg'] as String; // "62.35"
+    // ... render per-member result
+  }
+});
+```
+
+### Manual override
+
+When the patient taps a member avatar ("measure for Dad") before
+stepping on the scale, pin that member explicitly:
+
+```dart
+LescaleController.selectProfile('dad-member-id');
+// → auto-pick is suspended; every locked weight goes to Dad.
+
+// Clear the pin when done:
+LescaleController.selectProfile(null);
+```
+
+### Tolerances and edge cases
+
+| Scenario | Picker decision |
+| --- | --- |
+| Measurement within ±5 kg of one profile | That profile auto-selected |
+| Two profiles equidistant from measurement | First declared one wins |
+| Measurement outside ±5 kg of every profile | Falls back to `activeMemberId` (or first member) |
+| `selectProfile(id)` called first | Always uses the pinned profile, weight ignored |
+| Profile list refreshed and pinned id no longer exists | Pin auto-cleared, auto-pick resumes |
+
+Adjust the tolerance:
+```dart
+LescaleController.autoPickToleranceKg = 8.0; // wider net for larger households
 ```
 
 ---
@@ -398,9 +587,9 @@ await progressSub.cancel();
 
 ### Decoding recorded files in Dart
 
-ER1 / ER2 / BP2 recordings are emitted as raw bytes in the
-`fileReadComplete` event. The plugin ships pure-Dart decoders for
-those three families that are byte-for-byte compatible with the
+ER1 / ER2 / BP2 / oxy / oxyII / pf10aw1 recordings are emitted as raw
+bytes in the `fileReadComplete` event. The plugin ships pure-Dart
+decoders for those families that are byte-for-byte compatible with the
 official Lepu Android SDK — both platforms run **the same parser**.
 
 ```dart
@@ -416,6 +605,16 @@ BluetodevController.fileReadCompleteStream.listen((file) {
     case Er1EcgFile ecg:
       print('${ecg.family} ECG ${ecg.duration}: '
             '${ecg.sampleCount} samples @ ${kEr1EcgSamplingRate} Hz');
+    case OxyFile oxy:
+      print('Oxy ${oxy.duration}: avg=${oxy.avgSpo2} min=${oxy.minSpo2} '
+            'o2Score=${oxy.o2Score} steps=${oxy.stepCounter} '
+            '${oxy.data.length} samples');
+    case OxyIIFile oxy:
+      print('OxyII ${oxy.duration}: avg=${oxy.avgSpo2} min=${oxy.minSpo2} '
+            'avgHr=${oxy.avgHr} steps=${oxy.stepCounter}');
+    case Pf10aw1File oxy:
+      print('Pf10aw1: ${oxy.sampleCount} samples @ ${oxy.interval}s '
+            '(start=${oxy.startTime} end=${oxy.endTime})');
   }
 });
 ```
@@ -428,6 +627,9 @@ empty (in which case the SDK only filled `parsed` — see below).
 | `bp2` (type=1) | [`Bp2BpFile`]  | `sys` / `dia` / `mean` / `pr` / `arrhythmia` / `measuredAt` |
 | `bp2` (type=2) | [`Bp2EcgFile`] | `hr` / `qrs` / `pvcs` / `qtc` / `diagnosis` (12-bit findings bitmask) / `waveShortData` (Int16) / `waveFloatData` (mV) / `connectCable` / `recordingTime` / `measuredAt` |
 | `er1`, `er2` | [`Er1EcgFile`] | `recordingTime` / `dataCrc` / `magic` / `waveShortData` (Int16) / `waveFloatData` (mV) |
+| `oxy`        | [`OxyFile`]    | `recordingTime` / `avgSpo2` / `minSpo2` / `dropsTimes{3,4,90}Percent` / `asleepTime{,Percent}` / `durationTime90Percent` / `o2Score` / `stepCounter` / `startTime` / `data` (`List<OxyEachData>` — per-second spo2/pr/vector/sleepState + warning bits) |
+| `oxyII`      | [`OxyIIFile`]  | `spo2List` / `prList` / `motionList` / `remindHrs` / `remindsSpo2` + footer aggregates (`avgSpo2`, `minSpo2`, `avgHr`, `stepCounter`, `o2Score`, …) + raw `pointBytes` |
+| `pf10aw1`    | [`Pf10aw1File`]| `spo2List` / `prList` + `startTime` / `endTime` / `interval` / `size` / `checkSum` / `magic` / `channelType` / `channelBytes` |
 
 Sampling rates and mV conversion factors are exposed as top-level
 constants — `kBp2EcgSamplingRate` (250 Hz), `kBp2EcgMvConversion`

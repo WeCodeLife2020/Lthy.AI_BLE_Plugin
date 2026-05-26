@@ -145,6 +145,20 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
 @property (nonatomic, copy)   NSString       *pendingReadFileName;
 @property (nonatomic, strong) NSMutableData  *pendingReadBuffer;
 @property (nonatomic, assign) uint32_t        pendingReadTotalSize;
+// When YES, the URAT chunk handler appends the in-flight chunk but
+// stops requesting the next one — emulating a pause without dropping
+// already-received bytes. `continueReadFile` re-issues
+// `[uratUtil readFile:buffer.length]` to resume from the current
+// offset; the device picks up exactly where it left off because URAT
+// readFile is offset-keyed.
+@property (nonatomic, assign) BOOL             pendingReadPaused;
+
+// Most-recently received BP config snapshot, cached so `setDeviceConfig`
+// can merge the consumer's requested fields on top without zeroing the
+// calibration / volume / language fields the consumer didn't touch.
+// Wrapped in NSValue because VTMBPConfig is a C struct. Cleared on
+// disconnect. nil before the first `requestBPConfig` round-trip.
+@property (nonatomic, strong) NSValue        *cachedBPConfig;
 
 // State
 @property (nonatomic, assign) BOOL serviceInitialized;
@@ -303,10 +317,16 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     if ([method isEqualToString:@"isServiceReady"])         { result(@(self.serviceInitialized));         return; }
     if ([method isEqualToString:@"checkPermissions"])       { result(@([self isBluetoothPoweredOn]));     return; }
     if ([method isEqualToString:@"requestPermissions"])     { [self handleRequestPermissions:result];     return; }
+    if ([method isEqualToString:@"getPermissionState"])     { [self handleGetPermissionState:result];     return; }
     if ([method isEqualToString:@"scan"])                   { [self handleScan:call result:result];       return; }
     if ([method isEqualToString:@"stopScan"])               { [self handleStopScan:result];               return; }
     if ([method isEqualToString:@"connect"])                { [self handleConnect:call result:result];    return; }
+    if ([method isEqualToString:@"connectKnown"])           { [self handleConnectKnown:call result:result]; return; }
     if ([method isEqualToString:@"disconnect"])             { [self handleDisconnect:result];             return; }
+    if ([method isEqualToString:@"syncTime"])               { [self handleSyncTime:call result:result];   return; }
+    if ([method isEqualToString:@"getBattery"])             { [self handleGetBattery:call result:result]; return; }
+    if ([method isEqualToString:@"getDeviceConfig"])        { [self handleGetDeviceConfig:call result:result]; return; }
+    if ([method isEqualToString:@"setDeviceConfig"])        { [self handleSetDeviceConfig:call result:result]; return; }
     if ([method isEqualToString:@"getConnectedModel"])      { result(@(self.connectedModel));             return; }
     if ([method isEqualToString:@"startMeasurement"])       { [self handleStartMeasurement:call result:result]; return; }
     if ([method isEqualToString:@"stopMeasurement"])        { [self handleStopMeasurement:call result:result];  return; }
@@ -315,17 +335,16 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     if ([method isEqualToString:@"readFile"])               { [self handleReadFile:call result:result];         return; }
     if ([method isEqualToString:@"cancelReadFile"])         { [self handleCancelReadFile:call result:result];   return; }
     if ([method isEqualToString:@"readHistoryData"])        { [self handleReadHistoryData:call result:result];  return; }
-    if ([method isEqualToString:@"pauseReadFile"]
-        || [method isEqualToString:@"continueReadFile"]) {
-        // The URAT protocol does not expose pause/continue; advise the
-        // caller to disconnect & reconnect for true cancellation.
-        result([FlutterError errorWithCode:@"UNSUPPORTED"
-                                   message:@"pause/continueReadFile is not supported on iOS; disconnect to abort"
-                                   details:nil]);
-        return;
-    }
+    if ([method isEqualToString:@"pauseReadFile"])          { [self handlePauseReadFile:result];                return; }
+    if ([method isEqualToString:@"continueReadFile"])       { [self handleContinueReadFile:result];             return; }
     if ([method isEqualToString:@"factoryReset"])           { [self handleFactoryReset:call result:result];     return; }
+    if ([method isEqualToString:@"shutdown"])               { [self handleShutdown:call result:result];         return; }
     if ([method isEqualToString:@"updateUserInfo"])         { [self handleUpdateUserInfo:call result:result]; return; }
+    if ([method isEqualToString:@"setScaleUserProfile"])    { [self handleSetScaleUserProfile:call result:result]; return; }
+    if ([method isEqualToString:@"setScaleUserList"])       { [self handleSetScaleUserList:call result:result];    return; }
+    if ([method isEqualToString:@"setScaleWeightUnit"])     { [self handleSetScaleWeightUnit:call result:result];  return; }
+    if ([method isEqualToString:@"setScaleRulerUnit"])      { [self handleSetScaleRulerUnit:call result:result];   return; }
+    if ([method isEqualToString:@"setKitchenScaleUnit"])    { [self handleSetKitchenScaleUnit:call result:result]; return; }
     result(FlutterMethodNotImplemented);
 }
 
@@ -364,6 +383,236 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     // do not need this data.
     (void)call;
     result(@YES);
+#endif
+}
+
+#if FBD_HAS_ICOMON
+// Build an ICUserInfo from the Dart wire dictionary documented in
+// `ScaleUserProfile.toMap()`. The mapping is straightforward except
+// for two quirks worth calling out:
+//
+//   * ICUserInfo uses `enableMeasureImpendence` (sic — typo lives in
+//     the SDK header) for impedance; we map our `enableImpedance`
+//     onto it.
+//   * `rulerMode` doesn't have a Dart wire field today — we always
+//     pin it to `ICRulerMeasureModeLength` which matches the value
+//     `_currentUserInfo` is initialised with at -init time. Surface
+//     this once a Dart consumer asks for circumference mode.
+- (ICUserInfo *)icUserInfoFromMap:(NSDictionary *)m {
+    ICUserInfo *u = [ICUserInfo new];
+    u.userIndex   = [m[@"userIndex"]    unsignedIntegerValue] ?: 1;
+    u.userId      = [m[@"userId"]       unsignedIntegerValue];
+    if ([m[@"nickName"] isKindOfClass:[NSString class]]) {
+        u.nickName = m[@"nickName"];
+    }
+    u.height      = [m[@"heightCm"]     unsignedIntegerValue] ?: 170;
+    u.age         = [m[@"age"]          unsignedIntegerValue] ?: 25;
+    u.sex         = (ICSexType)[m[@"sex"] integerValue];
+    u.weight      = [m[@"lastWeightKg"] floatValue];
+    u.peopleType  = (ICPeopleType)[m[@"peopleType"]    unsignedIntegerValue];
+    u.weightUnit  = (ICWeightUnit)[m[@"weightUnit"]    unsignedIntegerValue];
+    u.rulerUnit   = (ICRulerUnit)([m[@"rulerUnit"]     unsignedIntegerValue] ?: ICRulerUnitCM);
+    u.rulerMode   = ICRulerMeasureModeLength;
+    u.kitchenUnit = (ICKitchenScaleUnit)[m[@"kitchenUnit"] unsignedIntegerValue];
+    u.enableMeasureImpendence = [m[@"enableImpedance"]  boolValue];
+    u.enableMeasureHr         = [m[@"enableHeartRate"]  boolValue];
+    u.enableMeasureBalance    = [m[@"enableBalance"]    boolValue];
+    u.enableMeasureGravity    = [m[@"enableGravity"]    boolValue];
+    return u;
+}
+
+// Reverse of icUserInfoFromMap: takes an ICUserInfo (e.g. from the
+// onReceiveUserInfo / onReceiveUserInfoList callbacks) and produces
+// the wire dictionary `ScaleUserProfile.fromMap()` understands.
+- (NSDictionary *)mapFromIcUserInfo:(ICUserInfo *)u {
+    return @{
+        @"userIndex":       @(u.userIndex),
+        @"userId":          @(u.userId),
+        @"nickName":        u.nickName ?: [NSNull null],
+        @"heightCm":        @(u.height),
+        @"age":             @(u.age),
+        @"sex":             @(u.sex),
+        @"lastWeightKg":    @(u.weight),
+        @"peopleType":      @(u.peopleType),
+        @"weightUnit":      @(u.weightUnit),
+        @"rulerUnit":       @(u.rulerUnit),
+        @"kitchenUnit":     @(u.kitchenUnit),
+        @"enableImpedance": @(u.enableMeasureImpendence),
+        @"enableHeartRate": @(u.enableMeasureHr),
+        @"enableBalance":   @(u.enableMeasureBalance),
+        @"enableGravity":   @(u.enableMeasureGravity),
+    };
+}
+#endif
+
+// Rich-profile counterpart to handleUpdateUserInfo: accepts every
+// field a Dart consumer may want to push (including W-series user
+// id + nickname + measurement-feature flags).
+- (void)handleSetScaleUserProfile:(FlutterMethodCall *)call
+                          result:(FlutterResult)result {
+#if FBD_HAS_ICOMON
+    NSDictionary *args = call.arguments;
+    if (![args isKindOfClass:[NSDictionary class]]) {
+        result([FlutterError errorWithCode:@"BAD_ARG"
+                                   message:@"setScaleUserProfile expects a Map payload"
+                                   details:nil]);
+        return;
+    }
+    ICUserInfo *info = [self icUserInfoFromMap:args];
+    self.currentUserInfo = info;
+    if (self.iComonInitialized) {
+        [[ICDeviceManager shared] updateUserInfo:info];
+        FBD_LOG(@"iComon setScaleUserProfile pushed (userIndex=%lu)",
+                (unsigned long)info.userIndex);
+    }
+    result(@YES);
+#else
+    (void)call;
+    result(@YES);
+#endif
+}
+
+// Multi-user push to a W-series scale. The Dart wire payload is a
+// list of profile maps; we translate to NSArray<ICUserInfo *> and
+// hand off via the SDK's `setUserList:`. Note that this is the
+// *global* SDK-level user list (mirrored to every connected
+// W-series device); the per-device `setUserList:userInfos:` on the
+// setting manager is used when you want to scope to one device.
+- (void)handleSetScaleUserList:(FlutterMethodCall *)call
+                       result:(FlutterResult)result {
+#if FBD_HAS_ICOMON
+    NSArray *raw = call.arguments[@"profiles"];
+    if (![raw isKindOfClass:[NSArray class]]) {
+        result([FlutterError errorWithCode:@"BAD_ARG"
+                                   message:@"setScaleUserList expects {profiles: [...]} payload"
+                                   details:nil]);
+        return;
+    }
+    NSMutableArray<ICUserInfo *> *list = [NSMutableArray arrayWithCapacity:raw.count];
+    for (NSDictionary *m in raw) {
+        if ([m isKindOfClass:[NSDictionary class]]) {
+            [list addObject:[self icUserInfoFromMap:m]];
+        }
+    }
+    [[ICDeviceManager shared] setUserList:list];
+    FBD_LOG(@"iComon setUserList pushed (%lu profiles)", (unsigned long)list.count);
+    // If a device is connected and it's a W-series scale, ALSO push
+    // per-device so the on-device storage matches. The setting
+    // manager call is a no-op for non-W scales.
+    if (self.activeIComonDevice != nil) {
+        id<ICDeviceManagerSettingManager> mgr = [[ICDeviceManager shared] getSettingManager];
+        if ([mgr respondsToSelector:@selector(setUserList:userInfos:callback:)]) {
+            [mgr setUserList:self.activeIComonDevice
+                  userInfos:list
+                   callback:^(ICSettingCallBackCode code) {
+                FBD_LOG(@"iComon setUserList per-device code=%d", (int)code);
+            }];
+        }
+    }
+    result(@YES);
+#else
+    (void)call;
+    result(@YES);
+#endif
+}
+
+// Wrapper around `setScaleUnit:`. The `unit` argument is the raw
+// ICWeightUnit ordinal (kg=0, lb=1, st=2, jin=3). Returns false if
+// no iComon device is connected — the setting manager methods need
+// an explicit ICDevice handle.
+- (void)handleSetScaleWeightUnit:(FlutterMethodCall *)call
+                         result:(FlutterResult)result {
+#if FBD_HAS_ICOMON
+    if (self.activeIComonDevice == nil) {
+        result([FlutterError errorWithCode:@"NOT_CONNECTED"
+                                   message:@"No iComon scale connected"
+                                   details:nil]);
+        return;
+    }
+    NSNumber *unitNum = call.arguments[@"unit"];
+    if (unitNum == nil) {
+        result([FlutterError errorWithCode:@"BAD_ARG"
+                                   message:@"setScaleWeightUnit requires {unit: int}"
+                                   details:nil]);
+        return;
+    }
+    ICWeightUnit unit = (ICWeightUnit)[unitNum unsignedIntegerValue];
+    id<ICDeviceManagerSettingManager> mgr = [[ICDeviceManager shared] getSettingManager];
+    [mgr setScaleUnit:self.activeIComonDevice
+                 unit:unit
+             callback:^(ICSettingCallBackCode code) {
+        FBD_LOG(@"setScaleUnit code=%d", (int)code);
+    }];
+    result(@YES);
+#else
+    (void)call;
+    result([FlutterError errorWithCode:@"UNSUPPORTED"
+                               message:@"iComon subspec not active"
+                               details:nil]);
+#endif
+}
+
+- (void)handleSetScaleRulerUnit:(FlutterMethodCall *)call
+                        result:(FlutterResult)result {
+#if FBD_HAS_ICOMON
+    if (self.activeIComonDevice == nil) {
+        result([FlutterError errorWithCode:@"NOT_CONNECTED"
+                                   message:@"No iComon ruler connected"
+                                   details:nil]);
+        return;
+    }
+    NSNumber *unitNum = call.arguments[@"unit"];
+    if (unitNum == nil) {
+        result([FlutterError errorWithCode:@"BAD_ARG"
+                                   message:@"setScaleRulerUnit requires {unit: int}"
+                                   details:nil]);
+        return;
+    }
+    ICRulerUnit unit = (ICRulerUnit)[unitNum unsignedIntegerValue];
+    id<ICDeviceManagerSettingManager> mgr = [[ICDeviceManager shared] getSettingManager];
+    [mgr setRulerUnit:self.activeIComonDevice
+                 unit:unit
+             callback:^(ICSettingCallBackCode code) {
+        FBD_LOG(@"setRulerUnit code=%d", (int)code);
+    }];
+    result(@YES);
+#else
+    (void)call;
+    result([FlutterError errorWithCode:@"UNSUPPORTED"
+                               message:@"iComon subspec not active"
+                               details:nil]);
+#endif
+}
+
+- (void)handleSetKitchenScaleUnit:(FlutterMethodCall *)call
+                          result:(FlutterResult)result {
+#if FBD_HAS_ICOMON
+    if (self.activeIComonDevice == nil) {
+        result([FlutterError errorWithCode:@"NOT_CONNECTED"
+                                   message:@"No iComon kitchen scale connected"
+                                   details:nil]);
+        return;
+    }
+    NSNumber *unitNum = call.arguments[@"unit"];
+    if (unitNum == nil) {
+        result([FlutterError errorWithCode:@"BAD_ARG"
+                                   message:@"setKitchenScaleUnit requires {unit: int}"
+                                   details:nil]);
+        return;
+    }
+    ICKitchenScaleUnit unit = (ICKitchenScaleUnit)[unitNum unsignedIntegerValue];
+    id<ICDeviceManagerSettingManager> mgr = [[ICDeviceManager shared] getSettingManager];
+    [mgr setKitchenScaleUnit:self.activeIComonDevice
+                        unit:unit
+                    callback:^(ICSettingCallBackCode code) {
+        FBD_LOG(@"setKitchenScaleUnit code=%d", (int)code);
+    }];
+    result(@YES);
+#else
+    (void)call;
+    result([FlutterError errorWithCode:@"UNSUPPORTED"
+                               message:@"iComon subspec not active"
+                               details:nil]);
 #endif
 }
 
@@ -503,6 +752,7 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     self.lastEr1CurStatus     = -1;
     self.lastEr2CurStatus     = -1;
     self.lastBp2ParamDataType = -1;
+    self.cachedBPConfig       = nil;
 
     if ([sdk isEqualToString:@"icomon"]) {
 #if FBD_HAS_ICOMON
@@ -618,6 +868,413 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     result(@YES);
 }
 
+#pragma mark - Connect by known identifier (no scan)
+
+// Direct-connect to a peripheral CoreBluetooth remembers from a prior
+// session. The OS keeps the CBPeripheral instance around for at least
+// the lifetime of the app process — and often across launches — so a
+// re-launch can connect without paying for a fresh scan.
+//
+// Flow:
+//   1. Parse `mac` as an NSUUID and call
+//      `retrievePeripheralsWithIdentifiers:` on the central. If the OS
+//      still knows the peripheral we land in `discovered`/`mappings`
+//      immediately and connect like a normal `connect()` call.
+//   2. If the lookup misses (fresh install, the OS evicted us, the
+//      user erased Bluetooth settings…) we fall through to a short
+//      model-filtered scan and replay the connect once the device
+//      advertises. This is the same fallback `connect()` already does
+//      from the cache-empty branch, so the recovery path is identical.
+//
+// Important: the iComon path doesn't need direct-connect — `addDevice:`
+// already accepts a MAC string with no scan, so we just dispatch
+// straight to `handleConnect:` after relabelling the sdk argument.
+- (void)handleConnectKnown:(FlutterMethodCall *)call result:(FlutterResult)result {
+    NSString *sdk = call.arguments[@"sdk"] ?: @"lepu";
+    if ([sdk isEqualToString:@"icomon"]) {
+        // iComon SDK's addDevice already operates by MAC alone — defer
+        // to the standard connect flow.
+        [self handleConnect:call result:result];
+        return;
+    }
+
+    NSString *mac = call.arguments[@"mac"];
+    if (mac.length == 0) {
+        result([FlutterError errorWithCode:@"INVALID_ARGS"
+                                   message:@"mac is required"
+                                   details:nil]);
+        return;
+    }
+    NSNumber *modelObj = call.arguments[@"model"];
+    if (modelObj == nil) {
+        result([FlutterError errorWithCode:@"INVALID_ARGS"
+                                   message:@"model is required for connectKnown(sdk:lepu)"
+                                   details:nil]);
+        return;
+    }
+
+    // Try direct lookup first.
+    if (self.central == nil) {
+        // Initialise the central if the consumer hasn't yet — they're
+        // calling connectKnown straight after launch. Symmetric with
+        // how handleRequestPermissions nudges the central into existence.
+        self.central = [[CBCentralManager alloc] initWithDelegate:self
+                                                            queue:dispatch_get_main_queue()];
+    }
+    NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:mac];
+    CBPeripheral *known = nil;
+    if (uuid) {
+        NSArray<CBPeripheral *> *peripherals =
+            [self.central retrievePeripheralsWithIdentifiers:@[uuid]];
+        if (peripherals.count > 0) known = peripherals.firstObject;
+    }
+
+    if (known) {
+        // Hydrate the discovery cache so handleConnect's mac lookup
+        // succeeds. We don't have advertisement data on this path so
+        // populate just the mapping; deploy will fall back to the
+        // model id the consumer supplied.
+        VTMDeviceMapping *mapping = [VTMDeviceTypeMapper mappingForLepuModel:modelObj.integerValue];
+        if (mapping == nil) {
+            result([FlutterError errorWithCode:@"UNSUPPORTED_DEVICE"
+                                       message:@"Device model is not recognised by VTProductLib"
+                                       details:@{@"model": modelObj}]);
+            return;
+        }
+        self.discovered[mac] = known;
+        self.mappings[mac]   = mapping;
+        FBD_LOG(@"connectKnown direct-connect mac=%@ model=%ld",
+                mac, (long)modelObj.integerValue);
+        [self handleConnect:call result:result];
+        return;
+    }
+
+    // Fall back to a short scan to find the peripheral, then connect.
+    // The Dart side gets the same `connecting`/`connected` lifecycle as
+    // it would from a normal connect — no consumer change needed.
+    FBD_LOG(@"connectKnown miss for mac=%@ — falling back to scan", mac);
+    self.scanModelFilter = @[modelObj];
+    if (![self isBluetoothPoweredOn]) {
+        self.scanRequested = YES;
+    } else {
+        [self startCentralScan];
+    }
+    // Watchdog: stop after 10 s and fail the connect if the device
+    // hasn't been seen.
+    __weak typeof(self) weakSelf = self;
+    NSString *targetMac = [mac copy];
+    __block BOOL settled = NO;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (settled) return;
+        settled = YES;
+        typeof(self) s = weakSelf;
+        if (s == nil) return;
+        if (s.central.isScanning) [s.central stopScan];
+        if (s.discovered[targetMac] != nil) {
+            // Discovery happened in the window — promote to connect.
+            [s handleConnect:call result:result];
+        } else {
+            result([FlutterError errorWithCode:@"UNKNOWN_DEVICE"
+                                       message:@"connectKnown: peripheral not found within 10s. Call scan() and wait for deviceFound first."
+                                       details:@{@"mac": targetMac}]);
+        }
+    });
+    // Result is delivered from the watchdog block. Return now so the
+    // method channel call doesn't block.
+}
+
+#pragma mark - Time sync
+
+// Push phone time to the device so on-device recordings get accurate
+// timestamps. iOS URAT path uses `[VTMURATUtils syncTime:]` which
+// also accepts nil → uses the SDK's current-time helper internally;
+// the legacy O2 protocol exposes a `VTParamTypeDate` setting whose
+// content is the ISO-ish wall-clock string the firmware expects.
+- (void)handleSyncTime:(FlutterMethodCall *)call result:(FlutterResult)result {
+    if (![self ensureReady:result]) return;
+    VTMDeviceMapping *m = self.activeMapping;
+
+    NSNumber *epochMs = call.arguments[@"epochMs"];
+    NSDate *date = epochMs ? [NSDate dateWithTimeIntervalSince1970:epochMs.doubleValue / 1000.0]
+                            : [NSDate date];
+
+    if (m.protocolPath == VTMProtocolPathURAT) {
+        if (self.uratUtil == nil) {
+            result([FlutterError errorWithCode:@"NOT_READY"
+                                       message:@"URAT util not initialised"
+                                       details:nil]);
+            return;
+        }
+        [self.uratUtil syncTime:date];
+        result(@YES);
+        return;
+    }
+    if (m.protocolPath == VTMProtocolPathO2Legacy) {
+        if (self.o2Util == nil) {
+            result([FlutterError errorWithCode:@"NOT_READY"
+                                       message:@"O2 util not initialised"
+                                       details:nil]);
+            return;
+        }
+        // VTParamTypeDate's content is the device's local wall-clock
+        // formatted as "yyyy-MM-dd HH:mm:ss". Match the firmware spec:
+        // the device interprets the string in its own timezone, so we
+        // emit phone-local wall-clock — same convention the recorded
+        // file uses (see lib/src/parsers/bp2_file.dart timestamp note).
+        NSDateFormatter *df = [NSDateFormatter new];
+        df.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+        df.timeZone   = [NSTimeZone localTimeZone];
+        [self.o2Util beginToParamType:VTParamTypeDate content:[df stringFromDate:date]];
+        result(@YES);
+        return;
+    }
+    // Every other protocol path (AirBP / PC60FW / iComon) doesn't
+    // expose an on-device clock to sync — silently succeed so Dart
+    // code can call syncTime() unconditionally.
+    result(@YES);
+}
+
+#pragma mark - Battery query (on-demand)
+
+// Universal on iOS — every URAT family supports requestBatteryInfo,
+// and the legacy O2 protocol embeds the battery in `getInfo`.
+- (void)handleGetBattery:(FlutterMethodCall *)call result:(FlutterResult)result {
+    if (![self ensureReady:result]) return;
+    VTMDeviceMapping *m = self.activeMapping;
+
+    if (m.protocolPath == VTMProtocolPathURAT && self.uratUtil) {
+        [self.uratUtil requestBatteryInfo];
+        result(@YES);
+        return;
+    }
+    if (m.protocolPath == VTMProtocolPathO2Legacy && self.o2Util) {
+        // Legacy O2 ships battery inside the periodic info response, so
+        // a `beginGetInfo` triggers a battery emission via the
+        // o2GetInfoCallback pipeline (which already forwards
+        // `info.battery` as a deviceInfo event). To keep the wire-format
+        // uniform we re-fire after getInfo lands — simpler than wiring
+        // a synthetic battery event here. Consumers should listen on
+        // [BluetodevController.batteryStream] which we publish from
+        // getInfo's emit path below.
+        [self.o2Util beginGetInfo];
+        result(@YES);
+        return;
+    }
+    result([FlutterError errorWithCode:@"UNSUPPORTED"
+                               message:@"This device family does not expose a battery query on iOS"
+                               details:@{@"family": m.family ?: @"unknown"}]);
+}
+
+#pragma mark - Device configuration (get / set)
+
+- (void)handleGetDeviceConfig:(FlutterMethodCall *)call result:(FlutterResult)result {
+    if (![self ensureReady:result]) return;
+    VTMDeviceMapping *m = self.activeMapping;
+
+    if (m.protocolPath != VTMProtocolPathURAT || self.uratUtil == nil) {
+        result([FlutterError errorWithCode:@"UNSUPPORTED"
+                                   message:@"Device config is only available on URAT-family devices (BP2/BP3/WOxi/FOxi/ER1/ER2)"
+                                   details:@{@"family": m.family ?: @"unknown"}]);
+        return;
+    }
+    switch (m.vtmDeviceType) {
+        case VTMDeviceTypeBP:
+            [self.uratUtil requestBPConfig];   break;
+        case VTMDeviceTypeWOxi:
+            [self.uratUtil woxi_requestConfig]; break;
+        case VTMDeviceTypeFOxi:
+            [self.uratUtil foxi_requestConfig]; break;
+        case VTMDeviceTypeECG:
+            [self.uratUtil requestECGConfig];  break;
+        case VTMDeviceTypeER3:
+            [self.uratUtil requestER3Config];  break;
+        case VTMDeviceTypeBabyPatch:
+            [self.uratUtil baby_requestConfig]; break;
+        default:
+            result([FlutterError errorWithCode:@"UNSUPPORTED"
+                                       message:@"This device family does not expose a config query"
+                                       details:@{@"family": m.family ?: @"unknown"}]);
+            return;
+    }
+    result(@YES);
+}
+
+- (void)handleSetDeviceConfig:(FlutterMethodCall *)call result:(FlutterResult)result {
+    if (![self ensureReady:result]) return;
+    VTMDeviceMapping *m = self.activeMapping;
+    NSArray *fields = call.arguments[@"fields"];
+    if (![fields isKindOfClass:NSArray.class] || fields.count == 0) {
+        result([FlutterError errorWithCode:@"INVALID_ARGS"
+                                   message:@"fields must be a non-empty list"
+                                   details:nil]);
+        return;
+    }
+
+    if (m.protocolPath != VTMProtocolPathURAT || self.uratUtil == nil) {
+        result([FlutterError errorWithCode:@"UNSUPPORTED"
+                                   message:@"Device config is only available on URAT-family devices"
+                                   details:@{@"family": m.family ?: @"unknown"}]);
+        return;
+    }
+
+    switch (m.vtmDeviceType) {
+        case VTMDeviceTypeBP:
+            [self setBPConfigFields:fields result:result]; return;
+        case VTMDeviceTypeWOxi:
+            [self setWOxiConfigFields:fields result:result]; return;
+        case VTMDeviceTypeFOxi:
+            [self setFOxiConfigFields:fields result:result]; return;
+        default:
+            result([FlutterError errorWithCode:@"UNSUPPORTED"
+                                       message:@"setDeviceConfig is wired for BP / WOxi / FOxi families only"
+                                       details:@{@"family": m.family ?: @"unknown"}]);
+            return;
+    }
+}
+
+// BP family setConfig: takes a full VTMBPConfig struct. We require the
+// caller to have invoked getDeviceConfig at least once so we have a
+// cached snapshot — otherwise writing back risks zeroing the device's
+// calibration constants (which then need a service-grade re-cal).
+- (void)setBPConfigFields:(NSArray *)fields result:(FlutterResult)result {
+    if (self.cachedBPConfig == nil) {
+        result([FlutterError errorWithCode:@"NO_BASELINE"
+                                   message:@"BP setDeviceConfig requires a prior getDeviceConfig() — call it first so calibration fields aren't zeroed."
+                                   details:nil]);
+        return;
+    }
+    VTMBPConfig cfg;
+    [self.cachedBPConfig getValue:&cfg];
+    for (NSDictionary *field in fields) {
+        if (![field isKindOfClass:NSDictionary.class]) continue;
+        NSString *name  = field[@"name"];
+        id        value = field[@"value"];
+        if ([name isEqualToString:@"volume"]         && [value isKindOfClass:NSNumber.class]) cfg.volume = [value unsignedCharValue];
+        else if ([name isEqualToString:@"avgMeasureMode"] && [value isKindOfClass:NSNumber.class]) cfg.avg_measure_mode = [value unsignedCharValue];
+        else if ([name isEqualToString:@"deviceSwitch"]   && [value isKindOfClass:NSNumber.class]) cfg.device_switch    = [value unsignedCharValue];
+        else if ([name isEqualToString:@"unit"]           && [value isKindOfClass:NSNumber.class]) cfg.unit             = [value unsignedCharValue];
+        else if ([name isEqualToString:@"language"]       && [value isKindOfClass:NSNumber.class]) cfg.language         = [value unsignedCharValue];
+        else if ([name isEqualToString:@"timeUtc"]        && [value isKindOfClass:NSNumber.class]) cfg.time_utc         = [value unsignedCharValue];
+        else if ([name isEqualToString:@"soundOn"]        && [value isKindOfClass:NSNumber.class]) {
+            // Map bool → device_switch bit0 (sound). Preserve other bits.
+            if ([value boolValue]) cfg.device_switch |= 0x01;
+            else                   cfg.device_switch &= ~0x01;
+        }
+        else if ([name isEqualToString:@"targetPressure"] && [value isKindOfClass:NSNumber.class]) cfg.bp_test_target_pressure = [value unsignedShortValue];
+        else {
+            FBD_LOG(@"setBPConfigFields: ignoring unknown field '%@'", name);
+        }
+    }
+    // Persist the merged snapshot so the next set call layers on top.
+    self.cachedBPConfig = [NSValue valueWithBytes:&cfg objCType:@encode(VTMBPConfig)];
+    [self.uratUtil syncBPConfig:cfg];
+    result(@YES);
+}
+
+// WOxi family setConfig: one VTMOxiParamsOption per field, single
+// 4-byte value. The vendor enum maps name → type byte.
+- (void)setWOxiConfigFields:(NSArray *)fields result:(FlutterResult)result {
+    NSUInteger written = 0;
+    for (NSDictionary *field in fields) {
+        if (![field isKindOfClass:NSDictionary.class]) continue;
+        NSString *name = field[@"name"];
+        id      value  = field[@"value"];
+        if (![value isKindOfClass:NSNumber.class]) continue;
+        VTMWOxiSetParams type = [self woxiParamTypeForName:name];
+        if (type == 0 && ![name isEqualToString:@"all"]) {
+            FBD_LOG(@"setWOxiConfigFields: skipping unknown field '%@'", name);
+            continue;
+        }
+        VTMOxiParamsOption opt;
+        memset(&opt, 0, sizeof(opt));
+        opt.type        = (u_char)type;
+        opt.param.val   = [value unsignedIntValue];
+        [self.uratUtil woxi_syncConfigParam:opt];
+        written++;
+    }
+    result(@(written > 0));
+}
+
+// FOxi family setConfig: same per-field wire format as WOxi, different
+// type-enum mapping.
+- (void)setFOxiConfigFields:(NSArray *)fields result:(FlutterResult)result {
+    NSUInteger written = 0;
+    for (NSDictionary *field in fields) {
+        if (![field isKindOfClass:NSDictionary.class]) continue;
+        NSString *name = field[@"name"];
+        id      value  = field[@"value"];
+        if (![value isKindOfClass:NSNumber.class]) continue;
+        VTMFOxiSetParams type = [self foxiParamTypeForName:name];
+        if (type == 0 && ![name isEqualToString:@"all"]) {
+            FBD_LOG(@"setFOxiConfigFields: skipping unknown field '%@'", name);
+            continue;
+        }
+        VTMOxiParamsOption opt;
+        memset(&opt, 0, sizeof(opt));
+        opt.type        = (u_char)type;
+        opt.param.val   = [value unsignedIntValue];
+        [self.uratUtil foxi_syncConfigParam:opt];
+        written++;
+    }
+    result(@(written > 0));
+}
+
+// Field-name → VTMWOxiSetParams enum mapping. Returns 0 (== "all",
+// reserved) when the name is unknown so the caller can detect misses.
+- (VTMWOxiSetParams)woxiParamTypeForName:(NSString *)name {
+    static NSDictionary<NSString *, NSNumber *> *table = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        table = @{
+            @"spo2RemindSw": @(VTMWOxiSetParamsSpO2Sw),
+            @"spo2Thr":      @(VTMWOxiSetParamsSpO2Thr),
+            @"hrRemindSw":   @(VTMWOxiSetParamsHRSw),
+            @"hrThrLow":     @(VTMWOxiSetParamsHRThrLow),
+            @"hrThrHigh":    @(VTMWOxiSetParamsHRThrHigh),
+            @"motor":        @(VTMWOxiSetParamsMotor),
+            @"buzzer":       @(VTMWOxiSetParamsBuzzer),
+            @"displayMode":  @(VTMWOxiSetParamsDisplayMode),
+            @"brightness":   @(VTMWOxiSetParamsBrightness),
+            @"interval":     @(VTMWOxiSetParamsInterval),
+            @"timezone":     @(VTMWOxiSetParamsTimeZoom),
+            @"pushCtrl":     @(VTMWOxiSetParamsPushCtrl),
+            @"algAvgTime":   @(VTMWOxiSetParamsAlgAvgtime),
+            @"countdownTime":@(VTMWOxiSetParamsCountdownTime),
+            @"handedness":   @(VTMWOxiSetParamsHandedness),
+            @"motionSw":     @(VTMWOxiSetParamsMotionSw),
+            @"motionThr":    @(VTMWOxiSetParamsMotionThr),
+            @"invalidSignalSw":  @(VTMWOxiSetParamsInvalidSignalSw),
+            @"invalidSignalThr": @(VTMWOxiSetParamsInvalidSignalThr),
+            @"spo2FuncSw":   @(VTMWOxiSetParamsSpo2FuncSw),
+        };
+    });
+    NSNumber *n = table[name];
+    return n ? (VTMWOxiSetParams)n.unsignedIntegerValue : (VTMWOxiSetParams)0;
+}
+
+// Field-name → VTMFOxiSetParams enum mapping. Same conventions as
+// woxiParamTypeForName:.
+- (VTMFOxiSetParams)foxiParamTypeForName:(NSString *)name {
+    static NSDictionary<NSString *, NSNumber *> *table = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        table = @{
+            @"spo2Low":     @(VTMFOxiSetParamsSpO2Low),
+            @"prHigh":      @(VTMFOxiSetParamsPRHigh),
+            @"prLow":       @(VTMFOxiSetParamsPRLow),
+            @"alarm":       @(VTMFOxiSetParamsAlram),
+            @"measureMode": @(VTMFOxiSetParamsMeasureMode),
+            @"beep":        @(VTMFOxiSetParamsBeep),
+            @"language":    @(VTMFOxiSetParamsLanguage),
+            @"bleSw":       @(VTMFOxiSetParamsBleSw),
+            @"esMode":      @(VTMFOxiSetParamsESMode),
+        };
+    });
+    NSNumber *n = table[name];
+    return n ? (VTMFOxiSetParams)n.unsignedIntegerValue : (VTMFOxiSetParams)0;
+}
+
 - (void)armConnectionWatchdog {
     [self.connectionWatchdog invalidate];
     __weak typeof(self) weakSelf = self;
@@ -664,6 +1321,8 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
     self.pendingReadFileName  = nil;
     self.pendingReadBuffer    = nil;
     self.pendingReadTotalSize = 0;
+    self.pendingReadPaused    = NO;
+    self.cachedBPConfig       = nil;
     self.connectedModel = -1;
     self.serviceDeployed = NO;
     FBD_LOG(@"disconnect requested");
@@ -1114,11 +1773,13 @@ static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
             self.pendingReadFileName  = name;
             self.pendingReadBuffer    = [NSMutableData data];
             self.pendingReadTotalSize = 0;
+            self.pendingReadPaused    = NO;
             [self.uratUtil prepareReadFile:name];
         } else if (m.protocolPath == VTMProtocolPathO2Legacy) {
             self.pendingReadFileName  = name;
             self.pendingReadBuffer    = nil;
             self.pendingReadTotalSize = 0;
+            self.pendingReadPaused    = NO;
             [self.o2Util beginReadFileWithFileName:name];
         }
     }
@@ -1166,6 +1827,7 @@ static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
         self.pendingReadFileName  = fileName;
         self.pendingReadBuffer    = nil;
         self.pendingReadTotalSize = 0;
+        self.pendingReadPaused    = NO;
         [self.o2Util beginReadFileWithFileName:fileName];
         result(@YES);
         return;
@@ -1177,6 +1839,7 @@ static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
     self.pendingReadFileName  = fileName;
     self.pendingReadBuffer    = [NSMutableData data];
     self.pendingReadTotalSize = 0;
+    self.pendingReadPaused    = NO;
     [self.uratUtil prepareReadFile:fileName];
     result(@YES);
 }
@@ -1196,12 +1859,127 @@ static const NSTimeInterval kEcgRtWatchdogInterval = 2.5;
     self.pendingReadFileName  = nil;
     self.pendingReadBuffer    = nil;
     self.pendingReadTotalSize = 0;
+    self.pendingReadPaused    = NO;
     [self sendEvent:@{@"event": @"fileReadError",
                       @"deviceFamily": [self fileFamilyForActiveMapping],
                       @"model": @(self.connectedModel),
                       @"fileName": fileName ?: @"",
                       @"error": @"cancelled"}];
     result(@YES);
+}
+
+// pauseReadFile — flips the `pendingReadPaused` flag. The URAT chunk
+// handler appends the in-flight chunk that may already be in the
+// notify pipe but stops calling `readFile:offset` for the next one,
+// so the device falls silent. Idempotent: pausing twice is a no-op
+// that returns NO so consumers can detect the redundant call.
+//
+// For the legacy O2 download path (`o2Util beginReadFileWithFileName:`)
+// the SDK drives chunking itself with no per-chunk hook, so true
+// pause/resume isn't possible — the consumer must `cancelReadFile`
+// and re-issue the read instead. We surface that explicitly.
+- (void)handlePauseReadFile:(FlutterResult)result {
+    if (self.pendingReadFileName == nil) {
+        result(@NO);
+        return;
+    }
+    VTMDeviceMapping *m = self.activeMapping;
+    if (m.protocolPath == VTMProtocolPathO2Legacy) {
+        result([FlutterError errorWithCode:@"UNSUPPORTED"
+                                   message:@"Legacy O2 SDK has no per-chunk hook; cancelReadFile and retry instead."
+                                   details:nil]);
+        return;
+    }
+    if (self.pendingReadPaused) { result(@NO); return; }
+    self.pendingReadPaused = YES;
+    FBD_LOG(@"pauseReadFile: paused at %lu / %u bytes",
+            (unsigned long)self.pendingReadBuffer.length, self.pendingReadTotalSize);
+    result(@YES);
+}
+
+// continueReadFile — clears the pause flag and re-issues the next
+// chunk request at the current buffer offset. URAT readFile is
+// offset-keyed so the device picks up exactly where it left off.
+- (void)handleContinueReadFile:(FlutterResult)result {
+    if (self.pendingReadFileName == nil) {
+        result(@NO);
+        return;
+    }
+    if (!self.pendingReadPaused) { result(@NO); return; }
+    self.pendingReadPaused = NO;
+    if (self.uratUtil != nil) {
+        [self.uratUtil readFile:(uint32_t)self.pendingReadBuffer.length];
+    }
+    FBD_LOG(@"continueReadFile: resumed from %lu bytes",
+            (unsigned long)self.pendingReadBuffer.length);
+    result(@YES);
+}
+
+// shutdown — politely tell the device to power off. Only a handful of
+// families expose a dedicated opcode for this:
+//
+//   * BP2 family — `requestChangeBPState:VTMBPTargetStatusEnd` (already
+//     reused inside startMeasurement when mode=="off").
+//   * iComon kitchen scale — `powerOffKitchenScale:` from
+//     ICDeviceManager.SettingManager.
+//
+// For everything else (ER1/ER2/WOxi/FOxi/legacy O2/AirBP/PC60Fw/body
+// scales) the device has no shutdown command and powers off only via
+// the hardware button. We return UNSUPPORTED so consumers can choose
+// to disconnect instead.
+- (void)handleShutdown:(FlutterMethodCall *)call result:(FlutterResult)result {
+    if (![self ensureReady:result]) return;
+    VTMDeviceMapping *m = self.activeMapping;
+    if (m.protocolPath == VTMProtocolPathURAT &&
+        m.vtmDeviceType == VTMDeviceTypeBP &&
+        self.uratUtil   != nil) {
+        [self.uratUtil requestChangeBPState:VTMBPTargetStatusEnd];
+        result(@YES);
+        return;
+    }
+#if FBD_HAS_ICOMON
+    if (m.protocolPath == VTMProtocolPathIComon && self.activeIComonDevice != nil) {
+        id<ICDeviceManagerSettingManager> mgr = [[ICDeviceManager shared] getSettingManager];
+        if ([mgr respondsToSelector:@selector(powerOffKitchenScale:callback:)]) {
+            [mgr powerOffKitchenScale:self.activeIComonDevice callback:^(ICSettingCallBackCode code) {
+                FBD_LOG(@"powerOffKitchenScale callback code=%d", (int)code);
+            }];
+            result(@YES);
+            return;
+        }
+    }
+#endif
+    result([FlutterError errorWithCode:@"UNSUPPORTED"
+                               message:@"shutdown is not exposed by this device's protocol; disconnect instead."
+                               details:@{@"model": @(self.connectedModel)}]);
+}
+
+// getPermissionState — returns one of:
+//   "granted"        — central exists AND is poweredOn
+//   "denied"         — CBManagerStateUnauthorized
+//   "poweredOff"     — CBManagerStatePoweredOff
+//   "unsupported"    — CBManagerStateUnsupported (e.g. simulator)
+//   "notDetermined"  — central not yet instantiated OR state unknown/resetting
+//
+// Useful when consumers want to show a granular "Enable Bluetooth" vs
+// "Go to Settings" vs "This device doesn't support BLE" message
+// without juggling the raw integer state themselves.
+- (void)handleGetPermissionState:(FlutterResult)result {
+    NSString *state;
+    if (self.central == nil) {
+        state = @"notDetermined";
+    } else {
+        switch (self.central.state) {
+            case CBManagerStatePoweredOn:    state = @"granted";       break;
+            case CBManagerStateUnauthorized: state = @"denied";        break;
+            case CBManagerStatePoweredOff:   state = @"poweredOff";    break;
+            case CBManagerStateUnsupported:  state = @"unsupported";   break;
+            case CBManagerStateResetting:
+            case CBManagerStateUnknown:
+            default:                         state = @"notDetermined"; break;
+        }
+    }
+    result(state);
 }
 
 - (void)handleFactoryReset:(FlutterMethodCall *)call result:(FlutterResult)result {
@@ -1622,8 +2400,10 @@ commandCompletion:(u_char)cmdType
     }
     if (cmdType == VTMBLECmdGetBattery) {
         VTMBatteryInfo bi = [VTMBLEParser parseBatteryInfo:response];
-        [self sendEvent:@{@"event": @"battery",
-                          @"state": @(bi.state),
+        [self sendEvent:@{@"event":   @"battery",
+                          @"family":  self.activeMapping.family ?: @"unknown",
+                          @"model":   @(self.connectedModel),
+                          @"state":   @(bi.state),
                           @"percent": @(bi.percent),
                           @"voltage": @(bi.voltage)}];
         return;
@@ -1661,9 +2441,11 @@ commandCompletion:(u_char)cmdType
                           @"progress":     @(progress)}];
         if (self.pendingReadBuffer.length >= self.pendingReadTotalSize) {
             [self.uratUtil endReadFile];
-        } else {
+        } else if (!self.pendingReadPaused) {
             [self.uratUtil readFile:(uint32_t)self.pendingReadBuffer.length];
         }
+        // When paused we deliberately drop the next-chunk request — the
+        // device falls silent until `continueReadFile` re-issues it.
         return;
     }
     if (cmdType == VTMBLECmdEndRead) {
@@ -1956,14 +2738,24 @@ commandCompletion:(u_char)cmdType
 
     if (cmdType == VTMBPCmdGetConfig) {
         VTMBPConfig cfg = [VTMBLEParser parseBPConfig:response];
-        [self sendEvent:@{@"event":      @"deviceConfig",
-                          @"family":     family,
-                          @"model":      @(self.connectedModel),
-                          @"calibZero":  @(cfg.last_calib_zero),
-                          @"calibSlope": @(cfg.calib_slope),
-                          @"volume":     @(cfg.volume),
-                          @"unit":       @(cfg.unit),
-                          @"timeUtc":    @(cfg.time_utc)}];
+        // Cache so `setDeviceConfig` can merge consumer changes on top
+        // of the existing snapshot rather than wiping calibration /
+        // language / unused fields with zeroes.
+        self.cachedBPConfig = [NSValue valueWithBytes:&cfg objCType:@encode(VTMBPConfig)];
+        [self sendEvent:@{@"event":          @"deviceConfig",
+                          @"family":         family,
+                          @"model":          @(self.connectedModel),
+                          @"calibZero":      @(cfg.last_calib_zero),
+                          @"calibSlope":     @(cfg.calib_slope),
+                          @"volume":         @(cfg.volume),
+                          @"avgMeasureMode": @(cfg.avg_measure_mode),
+                          @"deviceSwitch":   @(cfg.device_switch),
+                          @"unit":           @(cfg.unit),
+                          @"language":       @(cfg.language),
+                          @"timeUtc":        @(cfg.time_utc),
+                          @"sleepTicks":     @(cfg.sleep_ticks),
+                          @"calibTicks":     @(cfg.calib_ticks),
+                          @"targetPressure": @(cfg.bp_test_target_pressure)}];
         return;
     }
 
@@ -2675,6 +3467,60 @@ commandCompletion:(u_char)cmdType
                       @"temperature":           @(data.temperature),
                       @"heartRate":             @(data.hr),
                       @"impedance":             @(data.imp)}];
+}
+
+// Reflected unit-changes from the device itself (user pressed the
+// unit button on the scale, or our setScale*Unit call took effect).
+// Emit `scaleUnitChanged` so Dart can update its UI immediately
+// without waiting for the next weigh-in.
+- (void)onReceiveWeightUnitChanged:(ICDevice *)device
+                              unit:(ICWeightUnit)unit {
+    [self sendEvent:@{@"event":    @"scaleUnitChanged",
+                      @"subEvent": @"weight",
+                      @"mac":      device.macAddr ?: @"",
+                      @"unit":     @(unit)}];
+}
+
+- (void)onReceiveRulerUnitChanged:(ICDevice *)device
+                             unit:(ICRulerUnit)unit {
+    [self sendEvent:@{@"event":    @"scaleUnitChanged",
+                      @"subEvent": @"ruler",
+                      @"mac":      device.macAddr ?: @"",
+                      @"unit":     @(unit)}];
+}
+
+- (void)onReceiveKitchenScaleUnitChanged:(ICDevice *)device
+                                    unit:(ICKitchenScaleUnit)unit {
+    [self sendEvent:@{@"event":    @"scaleUnitChanged",
+                      @"subEvent": @"kitchen",
+                      @"mac":      device.macAddr ?: @"",
+                      @"unit":     @(unit)}];
+}
+
+// The device pushes back its currently-stored user profile (typically
+// after a multi-user W-series device finishes identifying which user
+// just stepped on it). Forward as `scaleUserInfo`.
+- (void)onReceiveUserInfo:(ICDevice *)device userInfo:(ICUserInfo *)userInfo {
+    if (device == nil || userInfo == nil) return;
+    NSMutableDictionary *evt = [@{@"event":        @"scaleUserInfo",
+                                  @"deviceFamily": @"icomon",
+                                  @"mac":          device.macAddr ?: @""} mutableCopy];
+    [evt addEntriesFromDictionary:[self mapFromIcUserInfo:userInfo]];
+    [self sendEvent:evt];
+}
+
+- (void)onReceiveUserInfoList:(ICDevice *)device
+                    userInfos:(NSArray<ICUserInfo *> *)userInfos {
+    if (device == nil) return;
+    NSMutableArray<NSDictionary *> *list =
+        [NSMutableArray arrayWithCapacity:userInfos.count];
+    for (ICUserInfo *u in userInfos) {
+        [list addObject:[self mapFromIcUserInfo:u]];
+    }
+    [self sendEvent:@{@"event":        @"scaleUserList",
+                      @"deviceFamily": @"icomon",
+                      @"mac":          device.macAddr ?: @"",
+                      @"profiles":     list}];
 }
 #endif  // FBD_HAS_ICOMON
 

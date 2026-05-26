@@ -6,6 +6,7 @@
 library;
 
 export 'src/bluetodev_controller.dart';
+export 'src/models/device_control.dart';
 export 'src/models/device_info.dart';
 export 'src/models/measurement_event.dart';
 export 'src/models/device_models.dart';
@@ -18,3 +19,4 @@ export 'src/lescale_controller.dart';
 export 'src/parsers/ecg_diagnosis.dart';
 export 'src/parsers/bp2_file.dart';
 export 'src/parsers/er1_er2_file.dart';
+export 'src/parsers/oxy_files.dart';

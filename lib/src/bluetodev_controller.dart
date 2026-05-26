@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/services.dart';
+import 'models/device_control.dart';
 import 'models/device_info.dart';
 import 'models/file_transfer.dart';
 import 'models/measurement_event.dart';
@@ -78,6 +79,25 @@ class BluetodevController {
   static Stream<Map<String, dynamic>> get deviceInfoStream =>
       eventStream.where((e) => e['event'] == 'deviceInfo');
 
+  /// Typed stream of [DeviceConfigEvent]s — emitted in response to
+  /// [getDeviceConfig], or spontaneously by some devices after a
+  /// `setDeviceConfig` write is acknowledged.
+  ///
+  /// The set of populated fields is family-dependent — see
+  /// [DeviceConfigEvent] for the per-family field reference.
+  static Stream<DeviceConfigEvent> get deviceConfigStream => eventStream
+      .where((e) => e['event'] == 'deviceConfig')
+      .map((e) => DeviceConfigEvent.fromMap(e));
+
+  /// Stream of battery snapshots. Fires on every [getBattery] response,
+  /// and also for devices that include battery info in their `rtData`
+  /// payload (BP2 / ER1 / ER2 / Oxy / WOxi etc.) — useful for keeping
+  /// a "battery" pill in sync without waiting on the next on-demand
+  /// query.
+  static Stream<BatteryInfo> get batteryStream => eventStream
+      .where((e) => e['event'] == 'battery')
+      .map((e) => BatteryInfo.fromMap(e));
+
   /// Raw stream of file-list responses (untyped map; for back-compat).
   static Stream<Map<String, dynamic>> get fileListStream =>
       eventStream.where((e) => e['event'] == 'fileList');
@@ -146,6 +166,32 @@ class BluetodevController {
     return result ?? false;
   }
 
+  /// Granular permission state for the running OS. Use this when the
+  /// boolean returned by [checkPermissions] isn't enough to drive UX
+  /// — e.g. to distinguish "user has never been asked" from
+  /// "permanently denied — open Settings", or "permissions OK but the
+  /// Bluetooth radio is OFF".
+  ///
+  /// Maps to:
+  ///  * **iOS** — `CBCentralManager.state` via
+  ///    `[CBCentralManager authorization]` semantics:
+  ///    `granted | denied | poweredOff | unsupported | notDetermined`.
+  ///  * **Android** — combines `BluetoothManager.adapter.isEnabled`
+  ///    with the runtime grant of `BLUETOOTH_SCAN` / `BLUETOOTH_CONNECT`
+  ///    (S+) or `ACCESS_FINE_LOCATION` (pre-S).
+  ///
+  /// Returns [BlePermissionState.notDetermined] if the native side
+  /// can't be reached (e.g. plugin not yet initialised on this
+  /// platform).
+  static Future<BlePermissionState> getPermissionState() async {
+    try {
+      final raw = await _method.invokeMethod<String>('getPermissionState');
+      return BlePermissionState.fromWire(raw);
+    } on PlatformException {
+      return BlePermissionState.notDetermined;
+    }
+  }
+
   // ════════════════════════════════════════════════════════════════════
   // Service lifecycle
   // ════════════════════════════════════════════════════════════════════
@@ -162,7 +208,14 @@ class BluetodevController {
     return result ?? false;
   }
 
-  /// Update the internal User Profile for scales (iComon)
+  /// Update the internal user profile for iComon scales. This is the
+  /// **shorthand** form that mirrors the original 0.x API — accepts
+  /// just height / age / sex and uses the documented iComon defaults
+  /// for everything else (userIndex=1, peopleType=normal,
+  /// weightUnit=kg, all measurement flags enabled).
+  ///
+  /// For multi-user setups or to override units, prefer
+  /// [setScaleUserProfile] with a fully-populated [ScaleUserProfile].
   static Future<bool> updateUserInfo({
     required double height,
     required int age,
@@ -172,6 +225,64 @@ class BluetodevController {
       'height': height,
       'age': age,
       'isMale': isMale,
+    });
+    return result ?? false;
+  }
+
+  /// Push a single, fully-populated [ScaleUserProfile] to the iComon
+  /// SDK's *global* user context — equivalent to the iOS
+  /// `[ICDeviceManager updateUserInfo:]` call. Use this **before**
+  /// connecting if you want the first weigh-in to apply the correct
+  /// BFA algorithm and unit.
+  ///
+  /// For W-series scales that store multiple profiles on-device, also
+  /// call [setScaleUserList] with the full list.
+  static Future<bool> setScaleUserProfile(ScaleUserProfile profile) async {
+    final result = await _method.invokeMethod<bool>(
+      'setScaleUserProfile',
+      profile.toMap(),
+    );
+    return result ?? false;
+  }
+
+  /// Push the entire multi-user list to a W-series iComon scale —
+  /// equivalent to `setUserList_W:` upstream. Older scales without
+  /// multi-user storage will return `false` (the native layer
+  /// reflects the SDK's `ICSettingCallBackCodeNotSupportFunction`).
+  ///
+  /// The list order does NOT have to match `userIndex` — the SDK
+  /// reads `userIndex` off each entry to route the profile to the
+  /// correct on-device slot.
+  static Future<bool> setScaleUserList(List<ScaleUserProfile> profiles) async {
+    final result = await _method.invokeMethod<bool>('setScaleUserList', {
+      'profiles': profiles.map((p) => p.toMap()).toList(),
+    });
+    return result ?? false;
+  }
+
+  /// Change the weight unit shown on the connected body scale.
+  /// Emits a `scaleUnitChanged` event with `subEvent: 'weight'` once
+  /// the device acks (also fires when the user flips the unit on
+  /// the device itself).
+  static Future<bool> setScaleWeightUnit(ScaleWeightUnit unit) async {
+    final result = await _method.invokeMethod<bool>('setScaleWeightUnit', {
+      'unit': unit.wire,
+    });
+    return result ?? false;
+  }
+
+  /// Change the tape-measure unit on the connected iComon ruler.
+  static Future<bool> setScaleRulerUnit(ScaleRulerUnit unit) async {
+    final result = await _method.invokeMethod<bool>('setScaleRulerUnit', {
+      'unit': unit.wire,
+    });
+    return result ?? false;
+  }
+
+  /// Change the unit on the connected iComon kitchen scale.
+  static Future<bool> setKitchenScaleUnit(KitchenScaleUnit unit) async {
+    final result = await _method.invokeMethod<bool>('setKitchenScaleUnit', {
+      'unit': unit.wire,
     });
     return result ?? false;
   }
@@ -228,10 +339,176 @@ class BluetodevController {
     return result ?? false;
   }
 
+  /// Connect to a previously-paired device by [mac] without a fresh
+  /// [scan] step.
+  ///
+  /// Use this on app launch to re-attach to the user's last device
+  /// without forcing a UI scan. On both platforms the underlying SDK
+  /// is asked for the peripheral by identifier:
+  ///
+  ///  * **iOS** — `[CBCentralManager retrievePeripheralsWithIdentifiers:]`
+  ///  * **Android** — `BluetoothAdapter.getRemoteDevice(mac)`
+  ///
+  /// Falls back to a short (≤10 s) scan if the OS no longer remembers
+  /// the peripheral (e.g. fresh install, BT cache cleared). The
+  /// resulting connection is identical to one established via
+  /// [connect] — same `connectionState` events, same `autoFetchOnFinish`
+  /// semantics.
+  ///
+  /// For iComon scales, [model] is ignored and you should pass
+  /// `sdk: 'icomon'`. For every other family [model] is required.
+  static Future<bool> connectKnown({
+    int? model,
+    required String mac,
+    String sdk = 'lepu',
+    bool autoFetchOnFinish = true,
+  }) async {
+    final result = await _method.invokeMethod<bool>('connectKnown', {
+      'model': ?model,
+      'mac': mac,
+      'sdk': sdk,
+      'autoFetchOnFinish': autoFetchOnFinish,
+    });
+    return result ?? false;
+  }
+
   /// Disconnect from the currently connected device.
   static Future<bool> disconnect() async {
     final result = await _method.invokeMethod<bool>('disconnect');
     return result ?? false;
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // Time sync
+  // ════════════════════════════════════════════════════════════════════
+
+  /// Push the phone's clock to the connected device so on-device
+  /// recordings carry an accurate timestamp.
+  ///
+  /// Without this, BP2 / ER1 / ER2 / O2Ring records drift after every
+  /// battery change because the device falls back to its factory RTC.
+  ///
+  /// The native bridge picks the right vendor call by family:
+  ///
+  ///  * **iOS URAT family** — `[VTMURATUtils syncTime:]` with the
+  ///    supplied [time] (default `DateTime.now()`).
+  ///  * **iOS legacy O2 family** — `[VTO2Communicate setRtcTime:]`.
+  ///  * **Android (lepu-blepro)** — `BleServiceHelper.syncTime(model)`.
+  ///    The Lepu helper always uses the phone's current time, so the
+  ///    [time] argument is ignored on Android. Pass `null` (the
+  ///    default) to make this explicit.
+  ///
+  /// Returns `false` if the device family doesn't expose a sync
+  /// primitive (iComon scales, AirBP, PC60FW family).
+  static Future<bool> syncTime({int? model, DateTime? time}) async {
+    final ms = time?.millisecondsSinceEpoch;
+    final result = await _method.invokeMethod<bool>('syncTime', {
+      'model': ?model,
+      'epochMs': ?ms,
+    });
+    return result ?? false;
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // Battery query
+  // ════════════════════════════════════════════════════════════════════
+
+  /// Request a one-shot battery reading from the connected device.
+  ///
+  /// Resolves with the next [BatteryInfo] event the device emits, or
+  /// times out (default 5 s) on devices that don't acknowledge.
+  ///
+  /// Coverage:
+  ///
+  ///  * **iOS** — every URAT-family device + legacy O2 ring. Universal.
+  ///  * **Android** — only AirBP, AP20, SP20, LEM, OxyII, and PC80B
+  ///    expose an on-demand battery query. For BP2 / ER1 / ER2 / Oxy
+  ///    /etc., the Lepu SDK ships battery as a side-effect of the
+  ///    real-time data stream — start a measurement and listen on
+  ///    [batteryStream] (or [measurementStream] for the per-rt-data
+  ///    `battery` field) to read the value.
+  ///
+  /// Throws a [PlatformException] with code `UNSUPPORTED` on the
+  /// Android-only families that have no direct query.
+  static Future<BatteryInfo?> getBattery({
+    int? model,
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
+    final next = batteryStream.first.timeout(
+      timeout,
+      onTimeout: () =>
+          throw TimeoutException('getBattery: device did not respond', timeout),
+    );
+    final ok = await _method.invokeMethod<bool>('getBattery', {
+      'model': ?model,
+    });
+    if (ok != true) return null;
+    return next;
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // Device configuration
+  // ════════════════════════════════════════════════════════════════════
+
+  /// Request the connected device's saved configuration.
+  ///
+  /// Resolves with the next [DeviceConfigEvent] the device emits.
+  /// The shape of [DeviceConfigEvent.fields] is family-dependent — see
+  /// the [ConfigField] doc for the keys each family understands.
+  ///
+  /// Supported families:
+  ///
+  ///  * **BP family** — BP2 / BP2A / BP2T / BP3 / BP3* (Android only
+  ///    for BP3; iOS exposes the richer BP2 config struct).
+  ///  * **WOxi family** — O2Ring S, S8/AW, BAND-WU and similar
+  ///    (iOS-only request — Android's lepu-blepro uses `oxy2*`
+  ///    methods which are wired separately; see
+  ///    [DeviceConfigEvent.family] == `oxy2` events).
+  ///  * **FOxi family** — PF-10BWS and similar.
+  ///  * **ER1 / ER2** — Android only.
+  ///  * **PF10AW1** — both platforms.
+  ///
+  /// Returns null if the call could not be issued (e.g. device not
+  /// connected, unsupported family).
+  static Future<DeviceConfigEvent?> getDeviceConfig({
+    int? model,
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
+    final next = deviceConfigStream.first.timeout(
+      timeout,
+      onTimeout: () => throw TimeoutException(
+        'getDeviceConfig: device did not respond',
+        timeout,
+      ),
+    );
+    final ok = await _method.invokeMethod<bool>('getDeviceConfig', {
+      'model': ?model,
+    });
+    if (ok != true) return null;
+    return next;
+  }
+
+  /// Push one or more configuration fields to the connected device.
+  ///
+  /// Use [ConfigField] for each setting you want to change — see the
+  /// [ConfigField] doc for the family-specific field names.
+  ///
+  /// On WOxi/FOxi devices the protocol writes one field at a time, so
+  /// passing N fields produces N round-trips. On BP2 / ER1 / ER2 / BP3
+  /// the SDK sends a struct in one shot with the supplied fields
+  /// merged on top of the current config.
+  ///
+  /// Returns `true` if every write was accepted by the SDK.
+  static Future<bool> setDeviceConfig(
+    List<ConfigField> fields, {
+    int? model,
+  }) async {
+    final list = fields.map((f) => f.toMap()).toList();
+    final ok = await _method.invokeMethod<bool>('setDeviceConfig', {
+      'model': ?model,
+      'fields': list,
+    });
+    return ok ?? false;
   }
 
   /// Get the currently connected device model, or -1 if none.
@@ -445,5 +722,32 @@ class BluetodevController {
       'model': ?model,
     });
     return result ?? false;
+  }
+
+  /// Politely power the connected device off.
+  ///
+  /// Coverage is currently sparse upstream:
+  ///
+  ///  * **iOS BP2 family** — issues `VTMBPTargetStatusEnd`, the same
+  ///    opcode `startMeasurement(mode: "off")` already uses.
+  ///  * **iOS iComon kitchen scale** — `powerOffKitchenScale:` from
+  ///    `ICDeviceManagerSettingManager`.
+  ///  * **iOS legacy O2 / URAT non-BP / Android any-family** — no
+  ///    shutdown opcode is exposed by the underlying SDK; this method
+  ///    returns `false` (after throwing `UNSUPPORTED` on the platform
+  ///    channel, swallowed here). Consumers should call [disconnect]
+  ///    as a fallback.
+  ///
+  /// Returns `true` if the device acked the shutdown request.
+  static Future<bool> shutdown({int? model}) async {
+    try {
+      final result = await _method.invokeMethod<bool>('shutdown', {
+        'model': ?model,
+      });
+      return result ?? false;
+    } on PlatformException catch (e) {
+      if (e.code == 'UNSUPPORTED') return false;
+      rethrow;
+    }
   }
 }

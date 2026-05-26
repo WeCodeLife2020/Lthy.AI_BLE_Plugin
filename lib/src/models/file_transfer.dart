@@ -18,6 +18,7 @@ import 'dart:typed_data';
 
 import '../parsers/bp2_file.dart';
 import '../parsers/er1_er2_file.dart';
+import '../parsers/oxy_files.dart';
 
 /// Response to [BluetodevController.getFileList].
 class FileListEvent {
@@ -150,9 +151,12 @@ class FileReadCompleteEvent {
   /// Decode [content] into a typed object using the bundled Dart-side
   /// parsers.  Currently supports:
   ///
-  ///  * `bp2` → [Bp2File] (subtype [Bp2BpFile] or [Bp2EcgFile])
-  ///  * `er1` → [Er1EcgFile]
-  ///  * `er2` → [Er1EcgFile] (same on-flash format as ER1)
+  ///  * `bp2`     → [Bp2File] (subtype [Bp2BpFile] or [Bp2EcgFile])
+  ///  * `er1`     → [Er1EcgFile]
+  ///  * `er2`     → [Er1EcgFile] (same on-flash format as ER1)
+  ///  * `oxy`     → [OxyFile]      (legacy O2Ring family)
+  ///  * `oxyII`   → [OxyIIFile]    (second-gen O2 series)
+  ///  * `pf10aw1` → [Pf10aw1File]  (Wellue Checkme O2)
   ///
   /// Returns `null` for any other family or when [content] is empty
   /// (i.e. the SDK only exposed pre-parsed fields via [parsed]).
@@ -171,6 +175,12 @@ class FileReadCompleteEvent {
         return Er1EcgFile.parseEr1(content);
       case 'er2':
         return Er1EcgFile.parseEr2(content);
+      case 'oxy':
+        return OxyFile.parse(content);
+      case 'oxyII':
+        return OxyIIFile.parse(content);
+      case 'pf10aw1':
+        return Pf10aw1File.parse(content);
       default:
         return null;
     }
