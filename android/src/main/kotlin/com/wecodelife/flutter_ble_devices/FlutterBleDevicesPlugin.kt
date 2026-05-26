@@ -1515,6 +1515,16 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 BleServiceHelper.BleServiceHelper.airBpStartBpTest(model)
             } else {
                 BleServiceHelper.BleServiceHelper.startRtTask(model)
+                // BP2A exposes a remote-start command (0x40) that tells the
+                // device to begin inflating immediately — the same command
+                // the iOS VTM SDK sends internally when startMeasurement is
+                // called. Without it the cuff only inflates when the user
+                // presses the physical button on the device.
+                // BP2 / BP2T / BP2W do NOT have a remote-start opcode;
+                // those models always require the physical button.
+                if (model == Bluetooth.MODEL_BP2A) {
+                    BleServiceHelper.BleServiceHelper.bp2aCmd0x40(model, true, false)
+                }
             }
             result.success(true)
         } catch (e: Exception) {
@@ -1529,6 +1539,13 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             return
         }
         try {
+            // For BP2A, send the remote-stop command so the device
+            // releases cuff pressure even if the user exits the page
+            // before the measurement completes. stopRtTask then tears
+            // down the event-bus subscription.
+            if (model == Bluetooth.MODEL_BP2A) {
+                BleServiceHelper.BleServiceHelper.bp2aCmd0x40(model, false, false)
+            }
             BleServiceHelper.BleServiceHelper.stopRtTask(model)
             result.success(true)
         } catch (e: Exception) {
