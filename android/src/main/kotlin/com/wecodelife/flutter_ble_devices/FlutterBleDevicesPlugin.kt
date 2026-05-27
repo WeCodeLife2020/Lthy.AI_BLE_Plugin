@@ -153,6 +153,11 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     private var lastEr1CurStatus: Int = -1
     private var lastEr2CurStatus: Int = -1
     private var lastBp2MeasureType: String = ""
+    // True after startMeasurement is called for BP2A; cleared when the device
+    // first reports STATUS_READY (at which point we fire bp2aCmd0x40 to start
+    // inflation). Sending the command immediately on connect races the device's
+    // post-connect init and is silently ignored by the firmware.
+    private var bp2aAutoStartPending: Boolean = false
     private var autoFetchOnFinish: Boolean = true
 
     // ── iComon Delegates ────────────────────────────────────────────────
@@ -1097,6 +1102,7 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             lastEr1CurStatus = -1
             lastEr2CurStatus = -1
             lastBp2MeasureType = ""
+            bp2aAutoStartPending = false
             result.success(true)
         } catch (e: Exception) {
             result.error("DISCONNECT_FAILED", e.message, null)
@@ -1521,7 +1527,7 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 // BP2 / BP2T / BP2W do NOT have a remote-start opcode;
                 // those models always require the physical button.
                 if (model == Bluetooth.MODEL_BP2A) {
-                    BleServiceHelper.BleServiceHelper.bp2aCmd0x40(model, true, false)
+                    bp2aAutoStartPending = true
                 }
             }
             result.success(true)
@@ -1536,6 +1542,7 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             result.error("NOT_CONNECTED", "No device connected", null)
             return
         }
+        bp2aAutoStartPending = false
         try {
             // For BP2A, send the remote-stop command so the device
             // releases cuff pressure even if the user exits the page
@@ -2381,6 +2388,20 @@ class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                         "batteryPercent" to data.status.percent,
                         "paramDataType" to data.param.paramDataType,
                     )
+                    val devStatus = data.status.deviceStatus
+                    // Auto-start: fire the start command the first time the
+                    // device reports STATUS_READY (3) after startMeasurement.
+                    // Sending it synchronously at connection time races the
+                    // device's post-connect init and is silently ignored.
+                    if (bp2aAutoStartPending) {
+                        when (devStatus) {
+                            3 -> { // STATUS_READY
+                                bp2aAutoStartPending = false
+                                BleServiceHelper.BleServiceHelper.bp2aCmd0x40(event.model, true, false)
+                            }
+                            4, 5 -> bp2aAutoStartPending = false // already measuring / just ended
+                        }
+                    }
                     when (data.param.paramDataType) {
                         0 -> {
                             val bpIng = com.lepu.blepro.ext.bp2.RtBpIng(data.param.paramData)
