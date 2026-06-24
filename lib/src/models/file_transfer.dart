@@ -1,7 +1,7 @@
 // Typed event models for the on-device file-transfer pipeline.
 //
 // Wire format (emitted by both the Android Kotlin plugin and the iOS
-// Obj-C plugin — `FlutterBleDevicesPlugin.kt`/`.m`):
+// Obj-C plugin — `LthyBlePlugin.kt`/`.m`):
 //
 //   { event: 'fileList',         model, deviceFamily?, files: [String] }
 //   { event: 'fileReadProgress', model, deviceFamily,  fileName?, progress: 0..1 }

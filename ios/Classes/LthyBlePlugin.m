@@ -1,6 +1,6 @@
 //
-//  FlutterBleDevicesPlugin.m
-//  flutter_ble_devices
+//  LthyBlePlugin.m
+//  lthy_ble_plugin
 //
 //  iOS bridge for Viatom/Lepu BLE medical devices.
 //
@@ -17,7 +17,7 @@
 //     the Android plugin uses.
 //
 
-#import "FlutterBleDevicesPlugin.h"
+#import "LthyBlePlugin.h"
 #import "VTMDeviceTypeMapper.h"
 #import "VTAirBPPacket.h"
 
@@ -52,7 +52,7 @@ static NSString *const kAirBPRxCharUUID  = @"6E400003-B5A3-F393-E0A9-E50E24DCCA9
 // and `ICDeviceInfo` — which collide with Apple's public
 // `ImageCaptureCore.framework` and private `iTunesCloud.framework`. We
 // surface that conflict only when the host app opts into the `IComon`
-// subspec (see `flutter_ble_devices.podspec`). When the subspec is not
+// subspec (see `lthy_ble_plugin.podspec`). When the subspec is not
 // active the iComon headers aren't on the include path and
 // `FBD_HAS_ICOMON` stays 0, which strips every iComon symbol from the
 // compiled binary.
@@ -81,9 +81,9 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
 
 #define FBD_LOG(fmt, ...) NSLog(@"[FBDevices] " fmt, ##__VA_ARGS__)
 
-#pragma mark - FlutterBleDevicesPlugin
+#pragma mark - LthyBlePlugin
 
-@interface FlutterBleDevicesPlugin () <FlutterStreamHandler,
+@interface LthyBlePlugin () <FlutterStreamHandler,
                                        CBCentralManagerDelegate,
                                        CBPeripheralDelegate,
                                        VTMURATDeviceDelegate,
@@ -241,12 +241,12 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
 
 @end
 
-@implementation FlutterBleDevicesPlugin
+@implementation LthyBlePlugin
 
 #pragma mark - FlutterPlugin
 
 + (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar {
-    FlutterBleDevicesPlugin *inst = [FlutterBleDevicesPlugin new];
+    LthyBlePlugin *inst = [LthyBlePlugin new];
     inst.methodChannel = [FlutterMethodChannel methodChannelWithName:kMethodChannelName
                                                      binaryMessenger:[registrar messenger]];
     [registrar addMethodCallDelegate:inst channel:inst.methodChannel];
@@ -796,7 +796,7 @@ static NSString *const kEventChannelName  = @"viatom_ble_stream";
         return;
 #else
         result([FlutterError errorWithCode:@"UNSUPPORTED"
-                                   message:@"iComon scale support is not compiled in. Add the 'IComon' subspec to your Podfile — see flutter_ble_devices README."
+                                   message:@"iComon scale support is not compiled in. Add the 'IComon' subspec to your Podfile — see lthy_ble_plugin README."
                                    details:nil]);
         return;
 #endif

@@ -1,6 +1,6 @@
 //
 //  VTMDeviceTypeMapper.m
-//  flutter_ble_devices
+//  lthy_ble_plugin
 //
 
 #import "VTMDeviceTypeMapper.h"

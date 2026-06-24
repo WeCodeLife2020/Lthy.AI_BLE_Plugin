@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.wecodelife.flutter_ble_devices">
+    package="com.wecodelife.lthy_ble_plugin">
 
     <!-- Legacy Bluetooth permissions (Android 11 and below) -->
     <uses-permission android:name="android.permission.BLUETOOTH" />

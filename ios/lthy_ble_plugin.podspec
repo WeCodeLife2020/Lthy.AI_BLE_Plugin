@@ -1,9 +1,9 @@
 #
 # To learn more about a Podspec see http://guides.cocoapods.org/syntax/podspec.html.
-# Run `pod lib lint flutter_ble_devices.podspec` to validate before publishing.
+# Run `pod lib lint lthy_ble_plugin.podspec` to validate before publishing.
 #
 Pod::Spec.new do |s|
-  s.name             = 'flutter_ble_devices'
+  s.name             = 'lthy_ble_plugin'
   s.version          = '1.0.0'
   s.summary          = 'Flutter plugin for Viatom/Lepu BLE medical devices.'
   s.description      = <<-DESC
@@ -11,7 +11,7 @@ Flutter plugin wrapping the official Viatom VTProductLib iOS SDK (and lepu-blepr
 on Android) to expose device scanning, connection, and real-time data streaming
 for ECG, Oximeter, Blood Pressure and Scale products.
                        DESC
-  s.homepage         = 'https://github.com/wecodelife/flutter_ble_devices'
+  s.homepage         = 'https://github.com/WeCodeLife2020/Lthy.AI_BLE_Plugin'
   s.license          = { :type => 'MIT', :file => '../LICENSE' }
   s.author           = { 'WeCodeLife' => 'dev@wecodelife.com' }
   s.source           = { :path => '.' }
@@ -44,7 +44,7 @@ for ECG, Oximeter, Blood Pressure and Scale products.
   # Apps that genuinely don't want the iComon SDK linked in can opt out
   # via their Podfile:
   #
-  #   pod 'flutter_ble_devices', :path => '...', :subspecs => ['Core']
+  #   pod 'lthy_ble_plugin', :path => '...', :subspecs => ['Core']
   s.default_subspecs = ['Core', 'IComon']
 
   # ── Core subspec ─────────────────────────────────────────────────────
@@ -66,15 +66,15 @@ for ECG, Oximeter, Blood Pressure and Scale products.
   # composition scale support via the iComon SDK:
   #
   #   target 'Runner' do
-  #     pod 'flutter_ble_devices', :path => '.../flutter_ble_devices',
+  #     pod 'lthy_ble_plugin', :path => '.../lthy_ble_plugin',
   #         :subspecs => ['Core', 'IComon']
   #   end
   #
-  # When included, `FlutterBleDevicesPlugin.m` compiles with
+  # When included, `LthyBlePlugin.m` compiles with
   # `__has_include(<ICDeviceManager/ICDeviceManager.h>)` satisfied and
   # activates the iComon code paths automatically.
   s.subspec 'IComon' do |ic|
-    ic.dependency 'flutter_ble_devices/Core'
+    ic.dependency 'lthy_ble_plugin/Core'
     ic.vendored_frameworks = [
       'Frameworks/ICDeviceManager.xcframework',
       'Frameworks/ICBleProtocol.xcframework',

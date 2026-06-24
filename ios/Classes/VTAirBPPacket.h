@@ -1,6 +1,6 @@
 //
 //  VTAirBPPacket.h
-//  flutter_ble_devices
+//  lthy_ble_plugin
 //
 //  Standalone builder/parser for Viatom AirBP / SmartBP blood-pressure
 //  monitors. This protocol is NOT covered by VTProductLib, so we implement

@@ -1,11 +1,11 @@
-package com.wecodelife.flutter_ble_devices
+package com.wecodelife.lthy_ble_plugin
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * Regression tests for the [FlutterBleDevicesPlugin.chooseCatchUpTargets]
+ * Regression tests for the [LthyBlePlugin.chooseCatchUpTargets]
  * decision function.
  *
  * These lock in the fix for the bug where a BP2/ER1/ER2 first-session

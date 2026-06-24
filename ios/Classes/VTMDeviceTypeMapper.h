@@ -1,6 +1,6 @@
 //
 //  VTMDeviceTypeMapper.h
-//  flutter_ble_devices
+//  lthy_ble_plugin
 //
 //  Maps Viatom BLE advertisement names to (a) a VTProductLib device-type token
 //  understood by `VTMURATUtils` and (b) the Android Lepu SDK integer model id

@@ -1,4 +1,4 @@
-group = "com.wecodelife.flutter_ble_devices"
+group = "com.wecodelife.lthy_ble_plugin"
 version = "1.0-SNAPSHOT"
 
 buildscript {
@@ -31,7 +31,7 @@ apply plugin: "com.android.library"
 apply plugin: "kotlin-android"
 
 android {
-    namespace = "com.wecodelife.flutter_ble_devices"
+    namespace = "com.wecodelife.lthy_ble_plugin"
 
     compileSdk = 36
 
@@ -92,10 +92,10 @@ android {
 rootProject.allprojects {
     repositories {
         maven { url 'https://jitpack.io' }
-        def flutterBleDevicesProject = rootProject.findProject(':flutter_ble_devices')
-        if (flutterBleDevicesProject != null) {
+        def lthyBlePluginProject = rootProject.findProject(':lthy_ble_plugin')
+        if (lthyBlePluginProject != null) {
             flatDir {
-                dirs flutterBleDevicesProject.file('libs')
+                dirs lthyBlePluginProject.file('libs')
             }
         }
     }

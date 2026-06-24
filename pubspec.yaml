@@ -1,4 +1,4 @@
-name: flutter_ble_devices
+name: lthy_ble_plugin
 description: "Flutter plugin for Viatom/Lepu BLE medical devices (ECG, Oximeter, BP). Wraps the official lepu-blepro Android SDK."
 version: 1.0.0
 
@@ -22,7 +22,7 @@ flutter:
   plugin:
     platforms:
       android:
-        package: com.wecodelife.flutter_ble_devices
-        pluginClass: FlutterBleDevicesPlugin
+        package: com.wecodelife.lthy_ble_plugin
+        pluginClass: LthyBlePlugin
       ios:
-        pluginClass: FlutterBleDevicesPlugin
+        pluginClass: LthyBlePlugin

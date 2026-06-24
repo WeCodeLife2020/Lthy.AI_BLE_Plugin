@@ -1,4 +1,4 @@
-package com.wecodelife.flutter_ble_devices
+package com.wecodelife.lthy_ble_plugin
 
 import android.Manifest
 import android.app.Activity
@@ -46,16 +46,16 @@ import cn.icomon.icdevicemanager.model.data.ICRulerData
 import cn.icomon.icdevicemanager.model.data.ICSkipData
 
 /**
- * FlutterBleDevicesPlugin — Flutter MethodChannel + EventChannel bridge to Lepu BLE SDK.
+ * LthyBlePlugin — Flutter MethodChannel + EventChannel bridge to Lepu BLE SDK.
  *
  * MethodChannel "viatom_ble"         → commands (scan, connect, startMeasurement, etc.)
  * EventChannel "viatom_ble_stream"   → events  (scan results, connection state, RT data)
  */
-class FlutterBleDevicesPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
+class LthyBlePlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     PluginRegistry.RequestPermissionsResultListener {
 
     companion object {
-        private const val TAG = "FlutterBleDevicesPlugin"
+        private const val TAG = "LthyBlePlugin"
         private const val METHOD_CHANNEL = "viatom_ble"
         private const val EVENT_CHANNEL = "viatom_ble_stream"
         private const val PERMISSION_REQUEST_CODE = 9527

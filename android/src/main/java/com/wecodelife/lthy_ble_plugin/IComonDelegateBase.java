@@ -1,4 +1,4 @@
-package com.wecodelife.flutter_ble_devices;
+package com.wecodelife.lthy_ble_plugin;
 
 import java.util.List;
 
