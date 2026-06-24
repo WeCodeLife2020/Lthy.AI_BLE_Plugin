@@ -156,6 +156,19 @@ class LescaleController {
   // Internal state for BIA unlock
   static double? _pendingWeight;
 
+  /// 0x00 = kg (default), 0x01 = lbs.  Set before or after connecting;
+  /// the byte is written into the BIA-unlock handshake on every connect.
+  static int _unitByte = 0x00;
+
+  /// Select the unit shown on the scale's physical display.
+  /// The app always receives weights in kg regardless of this setting.
+  static void setDisplayUnit({required bool useLbs}) {
+    _unitByte = useLbs ? 0x01 : 0x00;
+  }
+
+  /// Whether lbs is currently selected.
+  static bool get displayUnitIsLbs => _unitByte == 0x01;
+
   // Multi-user state.  Always at least one entry — the legacy single-
   // profile API funnels into _profiles[0] so existing consumers keep
   // working unchanged.
@@ -476,7 +489,7 @@ class LescaleController {
         payload[4] = (now >> 8) & 0xFF;
         payload[5] = now & 0xFF;
         payload[6] = 0x00; // Reserved
-        payload[7] = 0x00; // Unit: KG
+        payload[7] = _unitByte; // Unit: 0x00 = kg, 0x01 = lbs
 
         // User Entry (7 bytes) — uses the currently-selected profile
         // so the device's on-board BIA computation (when available)
